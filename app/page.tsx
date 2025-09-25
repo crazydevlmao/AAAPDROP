@@ -604,7 +604,7 @@ useEffect(() => {
           </button>
 
           {/* Wallets: overlays under the right buttons without shifting layout */}
-          <div className="absolute right-0 top-full mt-2 w-56 z-20">
+          <div className="absolute right-0 top-full mt-2 w-56 z-50">
             <WalletStrip />
           </div>
         </div>
@@ -1189,16 +1189,43 @@ function SolscanBtn({ value }: { value: string }) {
   );
 }
 
-/* === Wallet strip (copy with green success) === */
+/* === Wallet strip (copy with green success) — robust copy === */
 function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
   const [copied, setCopied] = useState(false);
-  async function onCopy() {
+
+  async function writeClipboard(text: string) {
+    // Try modern API first
     try {
-      await navigator.clipboard.writeText(addr);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
-    } catch {}
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fallback for odd browsers / blocked permissions
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.top = "-9999px";
+        ta.style.left = "-9999px";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return ok;
+      } catch {
+        return false;
+      }
+    }
   }
+
+  async function onCopy() {
+    const ok = await writeClipboard(addr);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
+  }
+
   return (
     <div className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 bg-[#101017] border border-[#24242f]">
       <div className="flex items-center gap-2 min-w-0">
@@ -1207,19 +1234,25 @@ function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
         </span>
         <span className="font-mono text-xs truncate">{short(addr, 6, 6)}</span>
       </div>
+
       <button
+        type="button"
         onClick={onCopy}
-        className={`text-[11px] px-2 py-1 rounded-md border transition-all
+        className={`text-[11px] px-2 py-1 rounded-md border transition-all active:scale-95
           ${copied
-            ? "bg-[var(--accent)] text-black border-transparent shadow"
-            : "bg-[#0c0c12] border-[#2a2a33] hover:bg-[#14141b] active:scale-95"}`}
+            ? "border-transparent shadow"
+            : "bg-[#0c0c12] border-[#2a2a33] hover:bg-[#14141b]"}`}
+        // when "copied", force the accent green so it’s obvious
+        style={copied ? { background: "#00FFC2", color: "#061915" } : undefined}
         title="Copy address"
+        aria-live="polite"
       >
         {copied ? "Copied!" : "Copy"}
       </button>
     </div>
   );
 }
+
 
 function WalletStrip() {
   return (
@@ -1244,3 +1277,4 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
