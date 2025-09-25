@@ -62,11 +62,9 @@ export async function getMintTokenProgramId(conn: Connection, mint: PublicKey): 
 /**
  * Build an **UNSIGNED** v0 transaction for the user to sign FIRST (Phantom-safe).
  * Flow:
- *   1) Client requests this from server (or builds on client).
+ *   1) Client requests/builds this.
  *   2) Wallet signs FIRST: tx = await wallet.signTransaction(tx)
- *   3) Send base64(tx) to server → server calls finalizeAndSendClaimTx() to partialSign with treasury & broadcast.
- *
- * No signatures are attached here to avoid Lighthouse warnings.
+ *   3) Send base64(tx) to server → server calls finalizeAndSendClaimTx() to sign with treasury & broadcast.
  */
 export async function buildClaimTx(opts: {
   conn: Connection;
@@ -161,7 +159,7 @@ export async function buildClaimTx(opts: {
 /**
  * Server-side helper: add treasury signature AFTER wallet signed first, then send+confirm.
  * - `walletSignedB64` must contain the wallet's signature already.
- * - This function **partialSign**s with the treasury keypair, then broadcasts.
+ * - This function signs with the treasury keypair and broadcasts.
  */
 export async function finalizeAndSendClaimTx(opts: {
   conn: Connection;
@@ -177,7 +175,8 @@ export async function finalizeAndSendClaimTx(opts: {
   const tx = VersionedTransaction.deserialize(Buffer.from(walletSignedB64, "base64"));
 
   // Add treasury signature AFTER the wallet (Phantom-safe order)
-  tx.partialSign(treasuryKp);
+  // NOTE: VersionedTransaction uses .sign([...]) to append signatures.
+  tx.sign([treasuryKp]);
 
   // Send & confirm
   const sig = await conn.sendRawTransaction(tx.serialize(), {
@@ -185,7 +184,6 @@ export async function finalizeAndSendClaimTx(opts: {
     preflightCommitment: commitment,
   });
 
-  // If you still have blockhash/lastValidBlockHeight from build step, you can pass them here.
   await conn.confirmTransaction({ signature: sig }, commitment);
 
   return { signature: sig };
