@@ -1,3 +1,4 @@
+// app/api/snapshot/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -7,49 +8,48 @@ import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { db } from "@/lib/db";
 
-type Holder = { wallet: string; balance: number };
-
-// ============ CONFIG ============
+// === CONFIG ===
 const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
-const SAFETY_LEAD_MS = 8_000;   // take at t-8s before window end
-const GRACE_AFTER_MS = 90_000;  // allow up to 90s late
+const SAFETY_LEAD_MS = 8_000;   // take snapshot at t-8s (server time)
+const GRACE_AFTER_MS = 90_000;  // allow +90s late
 const WINDOW_MS = CYCLE_MINUTES * 60_000;
 
-// ============ UTILS ============
-const noStoreHeaders: Record<string, string> = {
+// ⚠️ Align storage units with claim-preview
+const DECIMALS = 6;
+const TEN_POW_DEC = Math.pow(10, DECIMALS);
+const ENTITLEMENT_IS_RAW = String(process.env.ENTITLEMENT_IS_RAW || "").toLowerCase() === "true";
+
+const noStoreHeaders = {
   "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+  pragma: "no-cache",
+  expires: "0",
 };
 
 function sha256Hex(s: string) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 
-function baseUrl(req: any) {
+function baseUrl(req: Request) {
   if (process.env.INTERNAL_BASE_URL) return process.env.INTERNAL_BASE_URL.replace(/\/$/, "");
   if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, "");
   const u = new URL(req.url);
   return `${u.protocol}//${u.host}`;
 }
 
-/** Server-authoritative window math (UTC). */
+/** Window math (UTC) */
 function windowInfo(nowMs = Date.now()) {
   const idx = Math.floor(nowMs / WINDOW_MS);
   const start = idx * WINDOW_MS;
   const end = start + WINDOW_MS;
   const snapshotAt = end - SAFETY_LEAD_MS;
-  const cycleId = String(end); // stable 1-per-window id
+  const cycleId = String(end); // end-of-window ms
   return { idx, start, end, snapshotAt, cycleId };
 }
 
-// --- DB helpers with graceful fallbacks ---
 async function readSnapshot(cycleId: string): Promise<any | null> {
   try {
-    if (typeof (db as any).getSnapshot === "function") {
-      return (db as any).getSnapshot(cycleId);
-    }
-    if ((db as any).snapshot?.findUnique) {
-      return (db as any).snapshot.findUnique({ where: { cycleId } });
-    }
+    if (typeof (db as any).getSnapshot === "function") return (db as any).getSnapshot(cycleId);
+    if ((db as any).snapshot?.findUnique) return (db as any).snapshot.findUnique({ where: { cycleId } });
   } catch {}
   return null;
 }
@@ -58,7 +58,7 @@ async function writeSnapshotIdempotent(row: {
   cycleId: string;
   snapshotId: string;
   snapshotTs: string;
-  deltaPump: number;
+  deltaPump: number;        // UI units
   eligibleCount: number;
   holdersHash: string;
 }) {
@@ -69,15 +69,10 @@ async function writeSnapshotIdempotent(row: {
       create: row,
     });
   }
-  if (typeof (db as any).addSnapshot === "function") {
-    return (db as any).addSnapshot(row);
-  }
+  if (typeof (db as any).addSnapshot === "function") return (db as any).addSnapshot(row);
   if ((db as any).snapshot?.create) {
-    try {
-      return await (db as any).snapshot.create({ data: row });
-    } catch {
-      return await readSnapshot(row.cycleId);
-    }
+    try { return await (db as any).snapshot.create({ data: row }); }
+    catch { return await readSnapshot(row.cycleId); }
   }
   throw new Error("No snapshot writer available on db");
 }
@@ -111,14 +106,12 @@ async function addEntitlementsIdempotent(
   throw new Error("No entitlement writer available on db");
 }
 
-// ============ ROUTE ============
-export async function GET(req: any) {
+export async function GET(req: Request) {
   try {
     const now = Date.now();
     const { start, end, snapshotAt, cycleId } = windowInfo(now);
-    const snapshotId = cycleId; // 1 snapshot per cycle
+    const snapshotId = cycleId;
 
-    // 0) Already taken?
     const existing = await readSnapshot(cycleId);
     if (existing) {
       return NextResponse.json(
@@ -130,12 +123,12 @@ export async function GET(req: any) {
           deltaPump: existing.deltaPump ?? 0,
           eligibleCount: existing.eligibleCount ?? 0,
           holdersHash: existing.holdersHash ?? "",
+          pumpBalance: existing.deltaPump ?? 0, // convenience alias for UI
         },
         { headers: noStoreHeaders }
       );
     }
 
-    // 1) Too early → pending
     if (now < snapshotAt) {
       return NextResponse.json(
         { status: "pending", cycleId, window: { start, end, snapshotAt }, etaMs: snapshotAt - now },
@@ -143,37 +136,43 @@ export async function GET(req: any) {
       );
     }
 
-    // 2) Due or within grace → TAKE it (idempotent)
+    // Due or within grace → take it
     if (now <= snapshotAt + GRACE_AFTER_MS) {
+      // Pull holders from your API
       const origin = baseUrl(req);
-      const r = await fetch(`${origin}/api/holders?ts=${Date.now()}`, { cache: "no-store" });
+      const r = await fetch(`${origin}/api/holders?ts=${Date.now()}`, { cache: "no-store", headers: noStoreHeaders });
       if (!r.ok) throw new Error(`holders fetch failed: ${r.status}`);
-      const { holders = [] } = (await r.json()) as { holders: Holder[] };
+      const { holders = [] } = (await r.json()) as { holders: Array<{ wallet: string; balance: number }> };
 
       const eligible = holders;
       const eligibleCount = eligible.length;
       const totalBal = eligible.reduce((a, b) => a + (b.balance || 0), 0);
 
+      // Read PREP for THIS cycle
       const prep = await (db as any).getPrep?.(cycleId);
-      const cyclePump = Math.max(0, Number(prep?.acquiredPump || 0));
-      const allocPump = cyclePump * 0.95;
+      const cyclePumpUi = Math.max(0, Number(prep?.acquiredPump || 0)); // UI units
+      const allocPumpUi = cyclePumpUi * 0.95; // keep 5% reserve if desired
 
+      // Build entitlement rows in configured units
       const entRows: Array<{ snapshotId: string; wallet: string; amount: number; claimed: boolean }> = [];
-      if (allocPump > 0 && totalBal > 0) {
+      if (allocPumpUi > 0 && totalBal > 0) {
         for (const h of eligible) {
-          const share = (h.balance / totalBal) * allocPump;
-          if (share > 0) entRows.push({ snapshotId, wallet: h.wallet.toLowerCase(), amount: share, claimed: false });
+          const shareUi = (h.balance / totalBal) * allocPumpUi; // UI units
+          const amount = ENTITLEMENT_IS_RAW ? Math.floor(shareUi * TEN_POW_DEC) : shareUi;
+          if (amount > 0) {
+            entRows.push({ snapshotId, wallet: h.wallet.toLowerCase(), amount, claimed: false });
+          }
         }
       }
 
       const holdersHash = sha256Hex(JSON.stringify({ eligible }, null, 0));
       const snapshotTs = new Date().toISOString();
 
-      await writeSnapshotIdempotent({
+      const snapRow = await writeSnapshotIdempotent({
         cycleId,
         snapshotId,
         snapshotTs,
-        deltaPump: allocPump,
+        deltaPump: allocPumpUi,  // store UI units here
         eligibleCount,
         holdersHash,
       });
@@ -189,15 +188,15 @@ export async function GET(req: any) {
           snapshotTs,
           holders: eligible,
           eligible,
-          pumpBalance: allocPump,
-          perHolder: eligibleCount > 0 ? allocPump / eligibleCount : 0,
+          pumpBalance: allocPumpUi,   // UI expects this key
+          perHolder: eligibleCount > 0 ? allocPumpUi / eligibleCount : 0,
           holdersHash,
         },
         { headers: noStoreHeaders }
       );
     }
 
-    // 3) Beyond grace → missed
+    // Beyond grace → missed
     return NextResponse.json(
       { status: "missed", cycleId, window: { start, end, snapshotAt }, missedByMs: now - snapshotAt },
       { status: 202, headers: noStoreHeaders }
