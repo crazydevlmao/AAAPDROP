@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "https://YOUR-RENDER-SERVICE.onrender.com/api/$1" }
+    { "source": "/api/:path*", "destination": "https://aaapdrop.onrender.com/api/:path*" }
   ]
 }
