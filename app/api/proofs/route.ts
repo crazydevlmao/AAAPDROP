@@ -6,16 +6,18 @@ export const fetchCache = "force-no-store";
 
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+import { connection } from "@/lib/solana";
 
 const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
 const WINDOW_MS = CYCLE_MINUTES * 60_000;
 
-function windowInfo(nowMs = Date.now()) {
-  const idx = Math.floor(nowMs / WINDOW_MS);
-  const start = idx * WINDOW_MS;
-  const end = start + WINDOW_MS;
-  const cycleId = String(end);
-  return { idx, start, end, cycleId };
+function cycleIdAt(ms: number) {
+  const idx = Math.floor(ms / WINDOW_MS);
+  const end = (idx * WINDOW_MS) + WINDOW_MS;
+  return String(end);
+}
+function cycleIdMinus(cycleId: string, windows: number) {
+  return String(Number(cycleId) - windows * WINDOW_MS);
 }
 async function readPrep(cycleId: string) {
   try { return await (db as any).getPrep?.(cycleId); } catch { return null; }
@@ -27,60 +29,62 @@ async function readSnapshot(cycleId: string) {
   } catch {}
   return null;
 }
-function cycleIdMinus(cycleId: string, windows: number) {
-  const end = Number(cycleId);
-  return String(end - windows * WINDOW_MS);
-}
 
 export async function GET() {
   try {
-    // Look at the current cycle and also walk backwards a few windows to find latest data
     const now = Date.now();
-    const { cycleId: currentCycle } = windowInfo(now);
+    const current = cycleIdAt(now);
 
-    // Try current cycle first; if empty, peek 1–3 cycles back for "latest completed"
-    const cycleCandidates = [0, 1, 2, 3].map((k) => (k === 0 ? currentCycle : cycleIdMinus(currentCycle, k)));
-
-    let pickedCycle: string | null = null;
-    let prep: any = null;
+    // find the most recent cycle that HAS a snapshot
+    let snapCycle: string | null = null;
     let snap: any = null;
-
-    for (const cid of cycleCandidates) {
-      const p = await readPrep(cid);
+    for (const back of [0, 1, 2, 3, 4]) {
+      const cid = back === 0 ? current : cycleIdMinus(current, back);
       const s = await readSnapshot(cid);
-      if (p || s) {
-        pickedCycle = cid;
-        prep = p;
-        snap = s;
-        break;
+      if (s) { snapCycle = cid; snap = s; break; }
+    }
+
+    // If we truly have no snapshots yet, fall back to current/prep-only
+    const pickedCycle = snapCycle || current;
+    const prep = await readPrep(pickedCycle);
+
+    // optional: safety — if claimSig exists but is not collect_creator_fee, hide it
+    let claimSig: string | null = prep?.claimSig || null;
+    if (claimSig) {
+      try {
+        const conn = connection("confirmed");
+        const tx = await conn.getTransaction(claimSig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+        const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
+        const ok = logs.some(l => l.toLowerCase().includes("collect_creator_fee"));
+        if (!ok) claimSig = null;
+      } catch {
+        // if inspection fails, leave as-is; prepare-drop already verified
       }
     }
 
-    // Shape the "current" card
-    const current = {
+    const body = {
       snapshotId: snap?.snapshotId ?? pickedCycle,
       snapshotTs: snap?.snapshotTs ?? null,
       snapshotHash: snap?.holdersHash ?? snap?.snapshotHash ?? "",
-      pumpBalance: typeof snap?.deltaPump === "number" ? snap.deltaPump : 0, // UI shows "Delta $PUMP (allocated this cycle)"
-      // Creator rewards in SOL (UI: "Creator rewards (SOL, this cycle)")
-      creatorSol: typeof prep?.creatorSolDelta === "number" ? prep.creatorSolDelta : 0,
-      // PUMP swapped (from prep)
-      pumpSwapped: typeof prep?.acquiredPump === "number" ? prep.acquiredPump : 0,
+      pumpBalance: typeof snap?.deltaPump === "number" ? snap.deltaPump : 0, // Delta $PUMP (allocated this cycle)
+      creatorSol: typeof prep?.creatorSolDelta === "number" ? prep.creatorSolDelta : 0, // Creator rewards (SOL)
+      pumpSwapped: typeof prep?.acquiredPump === "number" ? prep.acquiredPump : 0,      // $PUMP swapped
       txs: {
-        claimSig: prep?.claimSig || null,
+        claimSig, // only if verified/kept
         swapSig: prep?.swapSigTreas || (Array.isArray(prep?.swapSigs) ? prep.swapSigs[0] : null),
       },
+      previous: [] as any[],
     };
 
-    // Build a small "previous" list
-    const previous: any[] = [];
-    for (let back = 1; back <= 5; back++) {
-      const cid = cycleIdMinus(pickedCycle || currentCycle, back);
-      const p = await readPrep(cid);
-      const s = await readSnapshot(cid);
+    // Build previous list (up to 5)
+    let cursor = pickedCycle;
+    for (let i = 0; i < 5; i++) {
+      cursor = cycleIdMinus(cursor, 1);
+      const p = await readPrep(cursor);
+      const s = await readSnapshot(cursor);
       if (!p && !s) continue;
-      previous.push({
-        snapshotId: s?.snapshotId ?? cid,
+      body.previous.push({
+        snapshotId: s?.snapshotId ?? cursor,
         snapshotTs: s?.snapshotTs ?? null,
         snapshotHash: s?.holdersHash ?? s?.snapshotHash ?? "",
         pumpBalance: typeof s?.deltaPump === "number" ? s.deltaPump : 0,
@@ -90,12 +94,11 @@ export async function GET() {
           claimSig: p?.claimSig || null,
           swapSig: p?.swapSigTreas || (Array.isArray(p?.swapSigs) ? p.swapSigs[0] : null),
         },
-        // Optional CSV if you ever attach it
         csv: s?.csv || null,
       });
     }
 
-    return NextResponse.json({ ...current, previous });
+    return NextResponse.json(body);
   } catch (e: any) {
     console.error("proofs error:", e);
     return NextResponse.json({ error: String(e?.message || e) }, { status: 500 });
