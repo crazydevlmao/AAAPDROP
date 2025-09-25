@@ -1,0 +1,12 @@
+# Don't ship the backend or disks to Vercel
+app/api/**
+data/**
+
+# Server-only libs used by API on Render
+lib/db.ts
+lib/price.ts
+
+# Misc you don't need on the UI build
+scripts/**
+*.md
+*.log
