@@ -38,8 +38,8 @@ export type Prep = {
 };
 
 export type Snapshot = {
-  cycleId: string;
-  snapshotId: string;
+  cycleId: string;       // UNIQUE (per-window)
+  snapshotId: string;    // we use = cycleId (deterministic), but kept explicit
   snapshotTs: string;
   deltaPump: number;
   eligibleCount: number;
@@ -48,8 +48,8 @@ export type Snapshot = {
 };
 
 export type Entitlement = {
-  snapshotId: string;
-  wallet: string;  // lowercase preferred
+  snapshotId: string;    // part of UNIQUE (snapshotId, wallet)
+  wallet: string;        // lowercase preferred; part of UNIQUE
   amount: number;
   claimed: boolean;
   claimSig?: string;
@@ -89,7 +89,10 @@ async function read<T>(f: string): Promise<T[]> {
 
 async function write<T>(f: string, rows: T[]) {
   await ensure();
-  await fs.writeFile(f, JSON.stringify(rows, null, 2));
+  // Write atomically via temp file then rename
+  const tmp = `${f}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(rows, null, 2));
+  await fs.rename(tmp, f);
 }
 
 async function readObj<T>(f: string, fallback: T): Promise<T> {
@@ -104,7 +107,52 @@ async function readObj<T>(f: string, fallback: T): Promise<T> {
 
 async function writeObj<T>(f: string, obj: T) {
   await ensure();
-  await fs.writeFile(f, JSON.stringify(obj, null, 2));
+  const tmp = `${f}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(obj, null, 2));
+  await fs.rename(tmp, f);
+}
+
+// ===== De-dupe helpers =====
+function dedupeSnapshotsKeepEarliest(rows: Snapshot[]): Snapshot[] {
+  // collapse by cycleId; keep earliest snapshotTs
+  const byCycle = new Map<string, Snapshot>();
+  for (const s of rows) {
+    const key = String(s.cycleId);
+    const prev = byCycle.get(key);
+    if (!prev) {
+      byCycle.set(key, s);
+    } else {
+      // keep the earliest created snapshot (lower snapshotTs)
+      if (new Date(s.snapshotTs).getTime() < new Date(prev.snapshotTs).getTime()) {
+        byCycle.set(key, s);
+      }
+    }
+  }
+  // sort by cycleId ascending; cap retention
+  const sorted = Array.from(byCycle.values()).sort((a, b) => Number(a.cycleId) - Number(b.cycleId));
+  // keep last N cycles (increase if you want more history)
+  const RETAIN = 200;
+  return sorted.slice(-RETAIN);
+}
+
+function dedupeEntitlementsMerge(rows: Entitlement[]): Entitlement[] {
+  // collapse by (snapshotId, wallet), merge claimed + claimSig
+  const map = new Map<string, Entitlement>();
+  for (const r of rows) {
+    const wallet = String(r.wallet || "").toLowerCase();
+    const key = `${r.snapshotId}::${wallet}`;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, { ...r, wallet });
+    } else {
+      // If either is claimed, claimed wins; prefer a defined claimSig
+      const claimed = prev.claimed || r.claimed;
+      const claimSig = r.claimSig || prev.claimSig;
+      // For amount, keep the first written (snapshot amount should be deterministic per wallet)
+      map.set(key, { ...prev, claimed, claimSig });
+    }
+  }
+  return Array.from(map.values());
 }
 
 // ===== Public DB API =====
@@ -122,43 +170,57 @@ export const db = {
   },
 
   // ---- snapshots ----
+  /** Idempotent add: one snapshot per cycleId (keeps earliest). */
   async addSnapshot(s: Snapshot) {
     const rows = await read<Snapshot>(files.snapshots);
     rows.push(s);
-    const trimmed = rows.slice(-20);
-    await write(files.snapshots, trimmed);
+    const deduped = dedupeSnapshotsKeepEarliest(rows);
+    await write(files.snapshots, deduped);
+  },
+  async getSnapshot(cycleId: string): Promise<Snapshot | undefined> {
+    const rows = await read<Snapshot>(files.snapshots);
+    // ensure uniqueness view
+    const deduped = dedupeSnapshotsKeepEarliest(rows);
+    return deduped.find(r => r.cycleId === cycleId);
   },
   async latestSnapshot(): Promise<Snapshot | undefined> {
     const rows = await read<Snapshot>(files.snapshots);
-    return rows[rows.length - 1];
+    const deduped = dedupeSnapshotsKeepEarliest(rows);
+    return deduped[deduped.length - 1];
   },
   async listSnapshots(): Promise<Snapshot[]> {
     const rows = await read<Snapshot>(files.snapshots);
-    return rows.slice();
+    return dedupeSnapshotsKeepEarliest(rows);
   },
 
   // ---- entitlements ----
+  /** Idempotent add: one row per (snapshotId, wallet). */
   async addEntitlements(rowsIn: Entitlement[]) {
     const rows = await read<Entitlement>(files.entitlements);
-    // normalize wallets to lowercase (no behavior change; just consistency)
-    rows.push(...rowsIn.map(r => ({ ...r, wallet: r.wallet.toLowerCase() })));
-    await write(files.entitlements, rows);
+    // normalize wallets to lowercase, then merge with existing
+    const combined = rows.concat(
+      rowsIn.map(r => ({ ...r, wallet: String(r.wallet || "").toLowerCase() }))
+    );
+    const deduped = dedupeEntitlementsMerge(combined);
+    await write(files.entitlements, deduped);
   },
   async listWalletEntitlements(wallet: string) {
     const rows = await read<Entitlement>(files.entitlements);
+    const deduped = dedupeEntitlementsMerge(rows);
     const w = wallet.toLowerCase();
-    return rows.filter(r => r.wallet.toLowerCase() === w);
+    return deduped.filter(r => r.wallet === w);
   },
   async markEntitlementsClaimed(wallet: string, snapshotIds: string[], sig: string) {
     const rows = await read<Entitlement>(files.entitlements);
     const w = wallet.toLowerCase();
     for (const r of rows) {
-      if (r.wallet.toLowerCase() === w && snapshotIds.includes(r.snapshotId) && !r.claimed) {
+      if (r.wallet.toLowerCase() === w && snapshotIds.includes(r.snapshotId)) {
         r.claimed = true;
-        r.claimSig = sig;
+        r.claimSig = r.claimSig || sig;
       }
     }
-    await write(files.entitlements, rows);
+    const deduped = dedupeEntitlementsMerge(rows);
+    await write(files.entitlements, deduped);
   },
 
   // ---- claims feed ----
