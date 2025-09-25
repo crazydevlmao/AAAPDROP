@@ -1,24 +1,27 @@
 // app/api/holders/route.ts
 export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export const dynamic = "force-dynamic"; // never static cache this route
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
-import { Connection, PublicKey, type Commitment } from "@solana/web3.js";
+import { Connection, PublicKey } from "@solana/web3.js";
 import {
   getMint,
+  AccountLayout,
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
-  AccountLayout,
 } from "@solana/spl-token";
 
-/** ===== In-memory cache ===== */
+/** Small in-memory throttle to avoid hammering RPC if many clients poll at once. */
 let cache:
-  | { at: number; data: { holders: Array<{ wallet: string; balance: number }> } }
+  | {
+      at: number; // ms
+      data: { holders: Array<{ wallet: string; balance: number }> };
+    }
   | null = null;
 
-const TTL_MS = 2000;
-const COMMITMENT: Commitment = "confirmed";
+/** Keep very short so UI polling sees near-real-time updates. */
+const TTL_MS = 1200;
 
 function pickRpc() {
   return (
@@ -40,62 +43,45 @@ function parseBlacklist(): Set<string> {
   return set;
 }
 
-async function fetchMintDecimals(conn: Connection, mintPk: PublicKey): Promise<number> {
-  try {
-    const mi = await getMint(conn, mintPk, COMMITMENT, TOKEN_PROGRAM_ID);
-    if (typeof mi.decimals === "number") return mi.decimals;
-  } catch {}
-  try {
-    const mi = await getMint(conn, mintPk, COMMITMENT, TOKEN_2022_PROGRAM_ID);
-    if (typeof mi.decimals === "number") return mi.decimals;
-  } catch {}
-  return 6;
+/** BigInt-safe: 10_000 * 10^decimals in raw/base units */
+function minRawThreshold(decimals: number): bigint {
+  const tenPow = 10n ** BigInt(Math.max(0, decimals | 0));
+  return 10_000n * tenPow;
 }
 
-// Legacy SPL (fixed 165-byte accounts)
-async function scanLegacy(
+async function fetchHoldersForProgram(
   conn: Connection,
-  mintPk: PublicKey
-): Promise<Map<string, bigint>> {
-  const perOwner = new Map<string, bigint>();
-  const accounts = await conn.getProgramAccounts(TOKEN_PROGRAM_ID, {
+  mintPk: PublicKey,
+  programId: PublicKey,
+  commitment: "confirmed" | "finalized"
+) {
+  const accounts = await conn.getProgramAccounts(programId, {
     filters: [
-      { dataSize: 165 },
-      { memcmp: { offset: 0, bytes: mintPk.toBase58() } },
+      { dataSize: 165 }, // token account size
+      { memcmp: { offset: 0, bytes: mintPk.toBase58() } }, // mint field
     ],
-    commitment: COMMITMENT,
+    commitment,
   });
+
+  const perOwner = new Map<string, bigint>();
+
   for (const acc of accounts) {
     try {
       const data = AccountLayout.decode(acc.account.data);
-      const owner = new PublicKey(data.owner).toBase58().toLowerCase();
-      const amt = BigInt(data.amount.toString());
-      if (amt > 0n) perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
-    } catch {}
-  }
-  return perOwner;
-}
+      // skip closed / uninitialized
+      if (!data || (data as any).isInitialized === 0) continue;
 
-// Token-2022 (TLV); use parsed accounts (no 165 filter)
-async function scanToken2022(
-  conn: Connection,
-  mintPk: PublicKey
-): Promise<Map<string, bigint>> {
-  const perOwner = new Map<string, bigint>();
-  const parsed = await conn.getParsedProgramAccounts(TOKEN_2022_PROGRAM_ID, {
-    filters: [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }],
-    commitment: COMMITMENT,
-  });
-  for (const item of parsed) {
-    try {
-      const info: any = (item.account.data as any).parsed?.info;
-      if (!info) continue;
-      const owner = String(info.owner || "").toLowerCase();
-      const rawStr = info.tokenAmount?.amount ?? "0";
-      const amt = BigInt(rawStr);
-      if (owner && amt > 0n) perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
-    } catch {}
+      const owner = new PublicKey(data.owner).toBase58().toLowerCase();
+      // amount is a BN-like; convert safely to BigInt
+      const amt = BigInt(data.amount.toString());
+      if (amt > 0n) {
+        perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
+      }
+    } catch {
+      // ignore malformed accounts
+    }
   }
+
   return perOwner;
 }
 
@@ -108,40 +94,54 @@ export async function GET() {
       });
     }
 
-    const MINT_STR = process.env.NEXT_PUBLIC_COIN_MINT || process.env.COIN_MINT || "";
+    const MINT_STR =
+      process.env.NEXT_PUBLIC_COIN_MINT || process.env.COIN_MINT || "";
     if (!MINT_STR) {
-      return NextResponse.json({ holders: [] }, { headers: { "cache-control": "no-store" } });
+      return NextResponse.json(
+        { holders: [] },
+        { headers: { "cache-control": "no-store" } }
+      );
     }
 
     const mintPk = new PublicKey(MINT_STR);
-    const conn = new Connection(pickRpc(), COMMITMENT);
-    const decimals = await fetchMintDecimals(conn, mintPk);
+    const rpc = pickRpc();
+    const commitment: "confirmed" = "confirmed";
 
-    const tenK = 10_000;
-    const minRaw = BigInt(Math.floor(tenK * Math.pow(10, decimals)));
+    const conn = new Connection(rpc, commitment);
 
-    const [legacy, tok2022] = await Promise.all([
-      scanLegacy(conn, mintPk).catch(() => new Map<string, bigint>()),
-      scanToken2022(conn, mintPk).catch(() => new Map<string, bigint>()),
+    // Get decimals from the mint (works for both token programs)
+    const mintInfo = await getMint(conn, mintPk, commitment).catch(() => null);
+    const decimals = mintInfo?.decimals ?? 0;
+    const minRaw = minRawThreshold(decimals);
+
+    // Query BOTH Token-2017 and Token-2022 to be safe
+    const [perOwnerA, perOwnerB] = await Promise.all([
+      fetchHoldersForProgram(conn, mintPk, TOKEN_PROGRAM_ID, commitment),
+      fetchHoldersForProgram(conn, mintPk, TOKEN_2022_PROGRAM_ID, commitment),
     ]);
 
-    const perOwner = new Map<string, bigint>();
-    for (const [k, v] of legacy.entries()) perOwner.set(k, (perOwner.get(k) ?? 0n) + v);
-    for (const [k, v] of tok2022.entries()) perOwner.set(k, (perOwner.get(k) ?? 0n) + v);
+    // Merge maps
+    const perOwner = new Map<string, bigint>(perOwnerA);
+    for (const [owner, raw] of perOwnerB) {
+      perOwner.set(owner, (perOwner.get(owner) ?? 0n) + raw);
+    }
 
+    // Apply blacklist and threshold, convert to UI units
     const blacklist = parseBlacklist();
     const holders = Array.from(perOwner.entries())
       .filter(([owner, raw]) => raw >= minRaw && !blacklist.has(owner))
       .map(([owner, raw]) => ({
         wallet: owner,
-        balance: Number(raw) / Math.pow(10, decimals),
+        balance: Number(raw) / 10 ** decimals,
       }))
       .sort((a, b) => b.balance - a.balance);
 
     const data = { holders };
     cache = { at: now, data };
 
-    return NextResponse.json(data, { headers: { "cache-control": "no-store" } });
+    return NextResponse.json(data, {
+      headers: { "cache-control": "no-store" },
+    });
   } catch (e) {
     console.error("holders route error:", e);
     return NextResponse.json(
