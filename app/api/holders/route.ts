@@ -24,7 +24,7 @@ let cache:
     }
   | null = null;
 
-const TTL_MS = 2_000; // 2s soft cache (in-process)
+const TTL_MS = 2000;
 
 function pickRpc() {
   return (
@@ -50,10 +50,10 @@ function parseBlacklist(): Set<string> {
 function minRawThreshold(decimals: number): bigint {
   const safeDec = Math.max(0, decimals | 0);
   const tenPow = BigInt(Math.floor(Math.pow(10, safeDec)));
-  return BigInt(10_000) * tenPow; // >= 10k tokens
+  return BigInt(10000) * tenPow; // >= 10k tokens
 }
 
-/** Try mint via classic; if missing/fails, try Token-2022. Return decimals + which program succeeded. */
+/** Try mint via classic; if missing/fails, try Token-2022. */
 async function fetchMintDecimals(
   conn: Connection,
   mintPk: PublicKey
@@ -70,7 +70,7 @@ async function fetchMintDecimals(
       return { decimals: m22.decimals, programId: TOKEN_2022_PROGRAM_ID };
     }
   } catch {}
-  // Fallback: assume 6 if unknown
+  // Fallback if RPC struggles
   return { decimals: 6, programId: null };
 }
 
@@ -79,38 +79,37 @@ async function collectBalancesForProgram(
   conn: Connection,
   mintPk: PublicKey,
   programId: PublicKey
-): Promise<Map<string, bigint>> {
-  // Use parsed accounts so Token-2022 extension sizes don’t break decoding
+): Promise<Map<string, bigint> & { __display?: Map<string, string> }> {
   const parsed = await conn.getParsedProgramAccounts(programId, {
     filters: [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }],
     commitment: "processed",
   });
 
-  const perOwner = new Map<string, bigint>();
+  const perOwner = new Map<string, bigint>() as Map<
+    string,
+    bigint
+  > & { __display?: Map<string, string> };
+  perOwner.__display = new Map<string, string>();
+
   for (const acc of parsed) {
     try {
       const data = acc.account.data as ParsedAccountData;
       if (data?.program !== "spl-token") continue;
       const info: any = data.parsed?.info;
-      // Expect info = { mint, owner, tokenAmount: { amount, decimals, uiAmount, ... }, ... }
       const owner: string | undefined = info?.owner;
       const amountStr: string | undefined = info?.tokenAmount?.amount;
       if (!owner || !amountStr) continue;
-      const amt = BigInt(amountStr);
-      if (amt <= 0n) continue;
 
-      // Keep original case for display; accumulate by lowercase key to dedupe
+      const amt = BigInt(amountStr);
+      if (amt <= BigInt(0)) continue;
+
       const keyLc = owner.toLowerCase();
-      const prev = perOwner.get(keyLc) ?? 0n;
+      const prev = perOwner.get(keyLc) ?? BigInt(0);
       perOwner.set(keyLc, prev + amt);
 
-      // Also stash the original-case display we saw first via a side map on the Map object
-      // @ts-ignore - attach once
-      if (!perOwner.__display) perOwner.__display = new Map<string, string>();
-      // @ts-ignore
-      if (!perOwner.__display.has(keyLc)) perOwner.__display.set(keyLc, owner);
+      if (!perOwner.__display!.has(keyLc)) perOwner.__display!.set(keyLc, owner);
     } catch {
-      /* ignore individual rows */
+      // ignore a bad row
     }
   }
   return perOwner;
@@ -137,13 +136,14 @@ export async function GET() {
     const mintPk = new PublicKey(mintStr);
     const conn = new Connection(pickRpc(), "processed");
 
-    // Fetch decimals (try classic, then 2022)
+    // Resolve decimals
     const { decimals } = await fetchMintDecimals(conn, mintPk);
     const minRaw = minRawThreshold(decimals);
     const denom = Math.pow(10, decimals || 0);
 
-    // Collect balances from BOTH programs to be safe
-    const maps: Map<string, bigint>[] = [];
+    // Pull both programs defensively
+    const maps: (Map<string, bigint> & { __display?: Map<string, string> })[] =
+      [];
     try {
       maps.push(await collectBalancesForProgram(conn, mintPk, TOKEN_PROGRAM_ID));
     } catch {}
@@ -153,16 +153,15 @@ export async function GET() {
       );
     } catch {}
 
-    // Merge maps keyed by lowercase owner, track a display map
+    // Merge maps by lowercase key; keep first-seen original-case for display
     const perOwner = new Map<string, bigint>();
     const display = new Map<string, string>(); // lc -> original-case
 
     for (const m of maps) {
       for (const [lc, amt] of m.entries()) {
-        perOwner.set(lc, (perOwner.get(lc) ?? 0n) + amt);
+        perOwner.set(lc, (perOwner.get(lc) ?? BigInt(0)) + amt);
       }
-      // @ts-ignore - read attached display map if present
-      const disp: Map<string, string> | undefined = m.__display;
+      const disp = m.__display;
       if (disp) {
         for (const [lc, d] of disp.entries()) {
           if (!display.has(lc)) display.set(lc, d);
@@ -176,9 +175,9 @@ export async function GET() {
     for (const [lc, raw] of perOwner.entries()) {
       if (raw < minRaw) continue;
       if (blacklist.has(lc)) continue;
-      const walletDisplay = display.get(lc) ?? lc; // prefer original-case if we saw it
+      const walletDisplay = display.get(lc) ?? lc;
       holders.push({
-        wallet: walletDisplay,               // 🚫 Do NOT lowercase for UI
+        wallet: walletDisplay, // original case for UI/links
         balance: Number(raw) / denom,
       });
     }
