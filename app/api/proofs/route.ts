@@ -5,88 +5,99 @@ export const revalidate = 0;
 export const fetchCache = "force-no-store";
 
 import { NextResponse } from "next/server";
-import { db, Snapshot } from "@/lib/db";
-import path from "path";
-import { promises as fs } from "fs";
+import { db } from "@/lib/db";
 
-export async function GET(req: Request) {
-  const url = new URL(req.url);
+const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
+const WINDOW_MS = CYCLE_MINUTES * 60_000;
 
-  // CSV download (holders list captured at that snapshot)
-  const csvId = url.searchParams.get("csv");
-  if (csvId) {
-    try {
-      const list = await db.listSnapshots();
-      const snap = list.find((s) => s.snapshotId === csvId);
-      if (!snap?.holdersCsvPath) {
-        return NextResponse.json({ error: "CSV not found" }, { status: 404, headers: { "cache-control": "no-store" } });
+function windowInfo(nowMs = Date.now()) {
+  const idx = Math.floor(nowMs / WINDOW_MS);
+  const start = idx * WINDOW_MS;
+  const end = start + WINDOW_MS;
+  const cycleId = String(end);
+  return { idx, start, end, cycleId };
+}
+async function readPrep(cycleId: string) {
+  try { return await (db as any).getPrep?.(cycleId); } catch { return null; }
+}
+async function readSnapshot(cycleId: string) {
+  try {
+    if (typeof (db as any).getSnapshot === "function") return await (db as any).getSnapshot(cycleId);
+    if ((db as any).snapshot?.findUnique) return await (db as any).snapshot.findUnique({ where: { cycleId } });
+  } catch {}
+  return null;
+}
+function cycleIdMinus(cycleId: string, windows: number) {
+  const end = Number(cycleId);
+  return String(end - windows * WINDOW_MS);
+}
+
+export async function GET() {
+  try {
+    // Look at the current cycle and also walk backwards a few windows to find latest data
+    const now = Date.now();
+    const { cycleId: currentCycle } = windowInfo(now);
+
+    // Try current cycle first; if empty, peek 1–3 cycles back for "latest completed"
+    const cycleCandidates = [0, 1, 2, 3].map((k) => (k === 0 ? currentCycle : cycleIdMinus(currentCycle, k)));
+
+    let pickedCycle: string | null = null;
+    let prep: any = null;
+    let snap: any = null;
+
+    for (const cid of cycleCandidates) {
+      const p = await readPrep(cid);
+      const s = await readSnapshot(cid);
+      if (p || s) {
+        pickedCycle = cid;
+        prep = p;
+        snap = s;
+        break;
       }
-      const abs = path.join(process.cwd(), snap.holdersCsvPath);
-      const csvText = await fs.readFile(abs, "utf8");
-      return new Response(csvText, {
-        headers: {
-          "Content-Type": "text/csv; charset=utf-8",
-          "Content-Disposition": `attachment; filename="holders_${csvId}.csv"`,
-          "Cache-Control": "no-store",
-        },
-      });
-    } catch (e) {
-      console.error("csv download error:", e);
-      return NextResponse.json({ error: "Failed to read CSV" }, { status: 500, headers: { "cache-control": "no-store" } });
     }
-  }
 
-  // Latest + previous (enriched)
-  const snaps: Snapshot[] = await db.listSnapshots(); // oldest..newest
-  const latest = snaps[snaps.length - 1];
-
-  async function enrich(s?: Snapshot) {
-    if (!s) return null as any;
-    const prep = await db.getPrep(s.cycleId); // what happened during prepare-drop for this interval
-    return {
-      snapshotId: s.snapshotId,
-      snapshotTs: s.snapshotTs,
-      snapshotHash: s.holdersHash,
-      pumpBalance: s.deltaPump,                 // allocated PUMP this cycle (after % cut)
-
-      // Extra proofs
-      claimedSol: prep?.claimedSol ?? 0,
-      claimSig: prep?.claimSig ?? null,
-      creatorSol: prep?.creatorSolDelta ?? 0,   // SOL claimed via lightning
-      pumpSwapped: prep?.acquiredPump ?? 0,     // PUMP bought this cycle (est.)
+    // Shape the "current" card
+    const current = {
+      snapshotId: snap?.snapshotId ?? pickedCycle,
+      snapshotTs: snap?.snapshotTs ?? null,
+      snapshotHash: snap?.holdersHash ?? snap?.snapshotHash ?? "",
+      pumpBalance: typeof snap?.deltaPump === "number" ? snap.deltaPump : 0, // UI shows "Delta $PUMP (allocated this cycle)"
+      // Creator rewards in SOL (UI: "Creator rewards (SOL, this cycle)")
+      creatorSol: typeof prep?.creatorSolDelta === "number" ? prep.creatorSolDelta : 0,
+      // PUMP swapped (from prep)
+      pumpSwapped: typeof prep?.acquiredPump === "number" ? prep.acquiredPump : 0,
       txs: {
         claimSig: prep?.claimSig || null,
-        teamSig: prep?.teamSig || null,
-        treasuryMoveSig: prep?.treasuryMoveSig || null,
-        swapSig: prep?.swapSigTreas || (prep?.swapSigs?.[0] ?? null),
+        swapSig: prep?.swapSigTreas || (Array.isArray(prep?.swapSigs) ? prep.swapSigs[0] : null),
       },
-
-      // CSV convenience link (front-end rewrite will proxy to Render)
-      csv: s.holdersCsvPath ? `/api/proofs?csv=${s.snapshotId}` : null,
     };
+
+    // Build a small "previous" list
+    const previous: any[] = [];
+    for (let back = 1; back <= 5; back++) {
+      const cid = cycleIdMinus(pickedCycle || currentCycle, back);
+      const p = await readPrep(cid);
+      const s = await readSnapshot(cid);
+      if (!p && !s) continue;
+      previous.push({
+        snapshotId: s?.snapshotId ?? cid,
+        snapshotTs: s?.snapshotTs ?? null,
+        snapshotHash: s?.holdersHash ?? s?.snapshotHash ?? "",
+        pumpBalance: typeof s?.deltaPump === "number" ? s.deltaPump : 0,
+        creatorSol: typeof p?.creatorSolDelta === "number" ? p.creatorSolDelta : 0,
+        pumpSwapped: typeof p?.acquiredPump === "number" ? p.acquiredPump : 0,
+        txs: {
+          claimSig: p?.claimSig || null,
+          swapSig: p?.swapSigTreas || (Array.isArray(p?.swapSigs) ? p.swapSigs[0] : null),
+        },
+        // Optional CSV if you ever attach it
+        csv: s?.csv || null,
+      });
+    }
+
+    return NextResponse.json({ ...current, previous });
+  } catch (e: any) {
+    console.error("proofs error:", e);
+    return NextResponse.json({ error: String(e?.message || e) }, { status: 500 });
   }
-
-  const latestEnriched = await enrich(latest);
-  const prevList = snaps.slice(0, -1);
-  const previous = (await Promise.all(prevList.reverse().map(enrich))).filter(Boolean);
-
-  return NextResponse.json(
-    {
-      // Back-compat fields your UI already reads:
-      snapshotId: latestEnriched?.snapshotId ?? null,
-      snapshotTs: latestEnriched?.snapshotTs ?? null,
-      snapshotHash: latestEnriched?.snapshotHash ?? null,
-      pumpBalance: latestEnriched?.pumpBalance ?? 0,
-      perHolder: 0,
-
-      // New surface:
-      creatorSol: latestEnriched?.creatorSol ?? 0,
-      pumpSwapped: latestEnriched?.pumpSwapped ?? 0,
-      txs: latestEnriched?.txs ?? null,
-
-      // Previous list (up to 20, db trims)
-      previous,
-    },
-    { headers: { "cache-control": "no-store" } }
-  );
 }
