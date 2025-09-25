@@ -72,7 +72,7 @@ function timeAgo(iso: string, now = new Date()) {
 }
 
 /* === Types === */
-type Holder = { wallet: string; balance: number };
+type Holder = { wallet: string; balance: number; display?: string };
 type RecentClaim = { wallet: string; amount: number; ts: string; sig: string };
 
 /* === Toast System === */
@@ -787,43 +787,23 @@ const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
                   </tr>
                 </thead>
                 <tbody>
-  {pageItems.map((h, i) => {
-    const globalIdx = (page - 1) * pageSize + i;
-    const rank = rankMap.get(h.wallet.toLowerCase()) ?? (globalIdx + 1);
-    const isMe = !!meLc && h.wallet.toLowerCase() === meLc;
-
-    return (
-      <tr
-        key={`${h.wallet}-${i}`}
-        className={`border-t border-[#222] transition-colors ${
-          isMe ? "bg-[#0f1513]/70" : ""
-        }`}
-        // optional: a faint left border accent when it's you
-        style={isMe ? { boxShadow: "inset 2px 0 0 #00FFC2" } : undefined}
-      >
-        <td className="px-3 py-2 w-12">#{rank}</td>
-
-        <td className="px-3 py-2 font-mono">
-          <div className="flex items-center gap-2">
-            <span className="truncate">{h.wallet}</span>
-            {isMe && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-md border border-yellow-500/40 text-yellow-300 bg-yellow-500/10">
-                YOU
-              </span>
-            )}
-          </div>
-        </td>
-
-        <td className="px-3 py-2">
-          {h.balance.toLocaleString(undefined, { maximumFractionDigits: 6 })}
-        </td>
-
-        <td className="px-3 py-2 text-right w-[110px]">
-          <SolscanBtn value={h.wallet} />
-        </td>
-      </tr>
-    );
-  })}
+ {pageItems.map((h, i) => {
+  const addrDisplay = h.display ?? h.wallet; // <- prefer display if server provides it
+  const globalIdx = (page - 1) * pageSize + i;
+  const rank = rankMap.get(h.wallet.toLowerCase()) ?? (globalIdx + 1);
+  return (
+    <tr key={`${h.wallet}-${i}`} className="border-t border-[#222]">
+      <td className="px-3 py-2 w-12">#{rank}</td>
+      <td className="px-3 py-2 font-mono">{addrDisplay}</td>   {/* <- show original case */}
+      <td className="px-3 py-2">
+        {h.balance.toLocaleString(undefined, { maximumFractionDigits: 6 })}
+      </td>
+      <td className="px-3 py-2 text-right w-[110px]">
+        <SolscanBtn value={addrDisplay} />                      {/* <- link using original case */}
+      </td>
+    </tr>
+  );
+})}
   {pageItems.length === 0 && (
     <tr>
       <td className="px-3 py-3 opacity-60" colSpan={4}>No holders yet for this view.</td>
@@ -1299,5 +1279,6 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
