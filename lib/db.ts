@@ -2,7 +2,9 @@
 import { promises as fs } from "fs";
 import path from "path";
 
-const dataDir = path.join(process.cwd(), "data");
+// lib/db.ts
+const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
+
 const files = {
   preps: path.join(dataDir, "preps.json"),
   snapshots: path.join(dataDir, "snapshots.json"),
@@ -273,4 +275,5 @@ export const db = {
     const claims = await read<Claim>(files.claims);
     return claims.reduce((acc, c) => acc + Number(c.amount || 0), 0);
   },
+
 };
