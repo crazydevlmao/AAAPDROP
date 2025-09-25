@@ -595,7 +595,7 @@ useEffect(() => {
           </button>
         </div>
         <div className="relative w-56 flex justify-end gap-2">
-          <a href="https://x.com" target="_blank" rel="noreferrer" className="px-4 py-2 rounded-xl border border-[#2a2a33] bg-[#111118] hover:bg-[#16161c] text-sm inline-flex items-center gap-2" title="Follow on X">
+          <a href="https://x.com/pumpdropapp" target="_blank" rel="noreferrer" className="px-4 py-2 rounded-xl border border-[#2a2a33] bg-[#111118] hover:bg-[#16161c] text-sm inline-flex items-center gap-2" title="Follow on X">
             <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M18.9 3H22l-7.7 8.8L22.8 21H17l-5-6l-5.6 6H2.3l8.4-9.2L2 3h5.1l4.5 5.4L18.9 3z" /></svg>
             
           </a>
@@ -1274,3 +1274,4 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
