@@ -64,12 +64,12 @@ export async function POST(req: Request) {
 
     // env
     const team = pubkeyFromEnv("TEAM_WALLET");
-    const treasuryKp = keypairFromEnv("TREASURY_SECRET"); // signer == source owner
+    const treasuryKp = keypairFromEnv("TREASURY_SECRET"); // server-held signer (source owner)
 
     // detect token program (Token-2020 vs Token-2022) for the PUMP mint
     const tokenProgramId = await getMintTokenProgramId(conn, PUMP_MINT);
 
-    // 1) DB entitlements (use lowercased wallet for lookups)
+    // 1) DB entitlements
     const rows: any[] = await db.listWalletEntitlements(walletLc);
     const unclaimedRows = rows.filter((r: any) => !isClaimedTrue(r?.claimed));
     const amountUi = unclaimedRows.reduce((a: number, r: any) => a + toUiAmount(r?.amount), 0);
@@ -85,7 +85,7 @@ export async function POST(req: Request) {
       });
     }
 
-    // 2) Probe **signer** treasury only (must match the key we can sign with)
+    // 2) Probe signer treasury (must match key we can sign with)
     const signerTreasuryPub = treasuryKp.publicKey;
     const signerProbe = await readPumpUiFromOwner(conn, signerTreasuryPub, tokenProgramId);
 
@@ -113,14 +113,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ txBase64: null, amount: 0, feeSol: 0.01, snapshotIds: [], note: "Below minimum transferable unit." });
     }
 
-    // 3) Build tx
+    // 3) Build tx — IMPORTANT: pass only the PUBLIC KEY
     const built = await buildClaimTx({
       conn,
-      treasuryKp,
+      treasuryPubkey: signerTreasuryPub,  // ← fix: pass PublicKey, not Keypair
       user: userPk,
       amountPump: sendUi,
       teamWallet: team,
-      tokenProgramId, // ← pass the detected program id
+      tokenProgramId,
     });
 
     if (!built?.txB64) {
