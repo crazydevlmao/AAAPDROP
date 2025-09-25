@@ -46,6 +46,15 @@ function b64ToU8a(b64: string): Uint8Array {
   for (let i = 0; i < len; i++) out[i] = binary.charCodeAt(i);
   return out;
 }
+function u8aToB64(u8: Uint8Array): string {
+  // chunk to avoid call stack overflow
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < u8.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, Array.from(u8.subarray(i, i + CHUNK)) as any);
+  }
+  return typeof btoa === "function" ? btoa(binary) : Buffer.from(binary, "binary").toString("base64");
+}
 function short(addr?: string, head = 6, tail = 6) {
   if (!addr) return "";
   if (addr.length <= head + tail) return addr;
@@ -179,7 +188,7 @@ function ConnectButton() {
 /* === Inner App === */
 function InnerApp() {
   const { connection } = useConnection();
-  const { publicKey, sendTransaction, connected } = useWallet();
+  const { publicKey, signTransaction, connected } = useWallet();
 
   /* Toast state */
   const [toast, setToast] = useState<{ msg: string; type: ToastType } | null>(null);
@@ -228,13 +237,12 @@ function InnerApp() {
   useEffect(() => { refreshMetrics(); }, []);
 
   // 🔁 Poll metrics every 10s so Total Distributed and Value update live
-useEffect(() => {
-  const id = setInterval(() => {
-    refreshMetrics();
-  }, 10000);
-  return () => clearInterval(id);
-}, []);
-
+  useEffect(() => {
+    const id = setInterval(() => {
+      refreshMetrics();
+    }, 10000);
+    return () => clearInterval(id);
+  }, []);
 
   /* Recent claims feed */
   const [recent, setRecent] = useState<RecentClaim[]>([]);
@@ -247,13 +255,12 @@ useEffect(() => {
   useEffect(() => { refreshRecent(); }, []);
 
   // 🔁 Poll recent claims every 5 seconds so everyone sees updates
-useEffect(() => {
-  const id = setInterval(() => {
-    refreshRecent();
-  }, 5000);
-  return () => clearInterval(id);
-}, []);
-
+  useEffect(() => {
+    const id = setInterval(() => {
+      refreshRecent();
+    }, 5000);
+    return () => clearInterval(id);
+  }, []);
 
   /* History (derived from recent for the connected wallet) */
   const myHistory = useMemo(() => {
@@ -384,13 +391,15 @@ useEffect(() => {
         body: JSON.stringify({ wallet: pk })
       }).then(r => r.json());
 
-      if (!out?.txBase64) {
+      const txBase64 = out?.txBase64 || out?.txB64; // accept either field name
+
+      if (!txBase64) {
         showToast(out?.note || "No unclaimed $PUMP.", "error");
         return;
       }
 
       setPreview({
-        txBase64: out.txBase64,
+        txBase64,
         amount: typeof out?.amount === "number" ? out.amount : 0,
         feeSol: typeof out?.feeSol === "number" ? out.feeSol : 0.01,
         snapshotIds: Array.isArray(out?.snapshotIds) ? out.snapshotIds : [],
@@ -406,6 +415,10 @@ useEffect(() => {
   async function confirmAndClaim() {
     try {
       if (!connected || !publicKey) return;
+      if (!signTransaction) {
+        showToast("Wallet cannot sign transactions.", "error");
+        return;
+      }
       setClaiming(true);
 
       // Always refresh preview to avoid stale blockhash/amount
@@ -415,7 +428,7 @@ useEffect(() => {
         body: JSON.stringify({ wallet: publicKey.toBase58() })
       }).then(r => r.json());
 
-      const txB64: string | null = fresh?.txBase64 ?? preview?.txBase64 ?? null;
+      const txB64: string | null = fresh?.txBase64 ?? fresh?.txB64 ?? preview?.txBase64 ?? null;
       const amountToClaim: number = typeof fresh?.amount === "number" ? fresh.amount : (preview?.amount ?? 0);
 
       const snapIds: string[] = Array.isArray(fresh?.snapshotIds)
@@ -429,9 +442,27 @@ useEffect(() => {
         return;
       }
 
-      // Send user-signed tx
-      const tx = VersionedTransaction.deserialize(b64ToU8a(txB64));
-      const sig = await sendTransaction(tx, connection, { skipPreflight: false });
+      // --- Phantom signs FIRST (per Lighthouse requirement) ---
+      const unsignedTx = VersionedTransaction.deserialize(b64ToU8a(txB64));
+      const userSigned = await signTransaction(unsignedTx);
+      const signedTxB64 = u8aToB64(userSigned.serialize());
+
+      // Send to server for additional signer + broadcast
+      const submit = await fetch("/api/claim-submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          wallet: publicKey.toBase58(),
+          signedTxB64,
+          snapshotIds: snapIds,
+          amount: amountToClaim,
+        }),
+      }).then(r => r.json());
+
+      if (!submit?.ok || !submit?.sig) {
+        throw new Error(submit?.error || "submit failed");
+      }
+      const sig = submit.sig as string;
 
       // Optimistically prepend claim to the feed (instant)
       setRecent(prev => ([
@@ -442,7 +473,7 @@ useEffect(() => {
       // Optimistically bump Total Distributed
       setTotalDistributedPump(prev => prev + amountToClaim);
 
-      // Close modal and report to backend → marks entitlements claimed + records claim + metrics
+      // Close modal and report to backend → metrics + feed aggregator (idempotent)
       setShowPreview(false);
       await fetch("/api/claim-report", {
         method: "POST",
@@ -451,7 +482,7 @@ useEffect(() => {
           wallet: publicKey.toBase58(),
           sig,
           snapshotIds: snapIds,
-          amount: amountToClaim,             // << IMPORTANT: send amount so server records feed + metrics
+          amount: amountToClaim,
         }),
       });
 
@@ -478,9 +509,26 @@ useEffect(() => {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ wallet: publicKey!.toBase58() })
         }).then(r => r.json());
-        if (retry?.txBase64) {
-          const tx2 = VersionedTransaction.deserialize(b64ToU8a(retry.txBase64));
-          const sig2 = await sendTransaction(tx2, connection, { skipPreflight: false });
+
+        const txB64 = retry?.txBase64 ?? retry?.txB64 ?? null;
+        if (txB64 && signTransaction) {
+          const unsigned2 = VersionedTransaction.deserialize(b64ToU8a(txB64));
+          const userSigned2 = await signTransaction(unsigned2);
+          const signedTxB64_2 = u8aToB64(userSigned2.serialize());
+
+          const submit2 = await fetch("/api/claim-submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              wallet: publicKey!.toBase58(),
+              signedTxB64: signedTxB64_2,
+              snapshotIds: Array.isArray(retry?.snapshotIds) ? retry.snapshotIds : [],
+              amount: typeof retry?.amount === "number" ? retry.amount : (preview?.amount ?? 0),
+            }),
+          }).then(r => r.json());
+
+          if (!submit2?.ok || !submit2?.sig) throw new Error(submit2?.error || "submit failed");
+          const sig2 = submit2.sig as string;
 
           const amt = typeof retry?.amount === "number" ? retry.amount : (preview?.amount ?? 0);
 
@@ -500,7 +548,7 @@ useEffect(() => {
               wallet: publicKey!.toBase58(),
               sig: sig2,
               snapshotIds: Array.isArray(retry?.snapshotIds) ? retry.snapshotIds : [],
-              amount: amt,                    // << send amount in retry path too
+              amount: amt,
             }),
           });
 
@@ -561,7 +609,7 @@ useEffect(() => {
   const progressPct = Math.max(0, Math.min(100, 100 - (msLeft / totalMs) * 100));
 
   // who am I (lowercased once for cheap comparisons)
-const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
+  const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
 
   /* My rank badge (if visible in the dataset) */
   const myRank = useMemo(() => {
@@ -616,17 +664,16 @@ const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
       {/* Main */}
       <main className="relative z-10 max-w-6xl mx-auto px-5">
         {/* ===== Toast Overlay (doesn't shift layout) ===== */}
-<div className="pointer-events-none absolute left-1/2 -translate-x-1/2 z-[9997] mt-2"
-     style={{ top: "72px" /* ~just under header/CA area */ }}>
-  <AnimatePresence>
-    {toast && (
-      <div className="pointer-events-auto">
-        <Toast msg={toast.msg} type={toast.type} />
-      </div>
-    )}
-  </AnimatePresence>
-</div>
-
+        <div className="pointer-events-none absolute left-1/2 -translate-x-1/2 z-[9997] mt-2"
+             style={{ top: "72px" /* ~just under header/CA area */ }}>
+          <AnimatePresence>
+            {toast && (
+              <div className="pointer-events-auto">
+                <Toast msg={toast.msg} type={toast.type} />
+              </div>
+            )}
+          </AnimatePresence>
+        </div>
 
         {/* HERO: Timer progress bar + time */}
         <section className="py-4 sm:py-8 flex flex-col items-center text-center gap-4">
@@ -787,14 +834,21 @@ const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
                   </tr>
                 </thead>
                 <tbody>
- {pageItems.map((h, i) => {
+{pageItems.map((h, i) => {
   const addrDisplay = h.display ?? h.wallet; // <- prefer display if server provides it
   const globalIdx = (page - 1) * pageSize + i;
   const rank = rankMap.get(h.wallet.toLowerCase()) ?? (globalIdx + 1);
   return (
     <tr key={`${h.wallet}-${i}`} className="border-t border-[#222]">
       <td className="px-3 py-2 w-12">#{rank}</td>
-      <td className="px-3 py-2 font-mono">{addrDisplay}</td>   {/* <- show original case */}
+<td className="px-3 py-2 font-mono">
+  <span>{addrDisplay}</span>
+  {meLc && meLc === (h.wallet?.toLowerCase?.() ?? "") && (
+    <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded-md border border-yellow-500/40 text-yellow-300 bg-yellow-500/10">
+      YOU
+    </span>
+  )}
+</td>
       <td className="px-3 py-2">
         {h.balance.toLocaleString(undefined, { maximumFractionDigits: 6 })}
       </td>
@@ -804,11 +858,11 @@ const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
     </tr>
   );
 })}
-  {pageItems.length === 0 && (
-    <tr>
-      <td className="px-3 py-3 opacity-60" colSpan={4}>No holders yet for this view.</td>
-    </tr>
-  )}
+{pageItems.length === 0 && (
+  <tr>
+    <td className="px-3 py-3 opacity-60" colSpan={4}>No holders yet for this view.</td>
+  </tr>
+)}
 </tbody>
 
               </table>
@@ -1072,7 +1126,7 @@ const meLc = publicKey?.toBase58()?.toLowerCase() ?? null;
               initial={{ opacity: 0, y: 20, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 20, scale: 0.98 }}
-              className="rounded-2xl p-4 bg-[#101017] border border-[#24242f] shadow-lg w-[min(420px,92vw)]"
+              className="rounded-2xl p-4 bg-[#101017] border border-[#24242f] shadow-lg w=[min(420px,92vw)]"
             >
               <div className="text-sm opacity-80">Nice! You just claimed</div>
               <div className="text-2xl font-semibold mt-1">{lastClaimAmt.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP</div>
@@ -1254,8 +1308,6 @@ function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
   );
 }
 
-
-
 function WalletStrip() {
   return (
     <div className="w-56 space-y-1 pointer-events-auto">
@@ -1279,6 +1331,3 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
-
-
-
