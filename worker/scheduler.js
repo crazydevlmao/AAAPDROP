@@ -1,33 +1,32 @@
-// worker/scheduler.ts
-import { setTimeout as sleep } from "timers/promises";
+// worker/scheduler.js
+const { setTimeout: sleep } = require("timers/promises");
 
-// ===== Config (mirrors your API routes) =====
+// ===== Config (mirror your API routes) =====
 const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
 const WINDOW_MS = CYCLE_MINUTES * 60_000;
 
-const PREP_LEAD_MS = 120_000;     // prepare-drop at t-2m
-const SNAP_LEAD_MS = 8_000;       // snapshot at t-8s
-const SNAP_GRACE_MS = 90_000;     // accept up to +90s late
+const PREP_LEAD_MS = 120_000;   // prepare-drop at t-2m
+const SNAP_LEAD_MS = 8_000;     // snapshot at t-8s
+const SNAP_GRACE_MS = 90_000;   // accept up to +90s late
 
-const JITTER_MS = 250 + Math.floor(Math.random() * 500); // tiny jitter at boot to avoid thundering herd
+const JITTER_MS = 250 + Math.floor(Math.random() * 500); // tiny jitter at boot
 
-// Require a base URL we can call
-function baseUrl(): string {
+function baseUrl() {
   const origin =
     process.env.INTERNAL_BASE_URL ||
     process.env.NEXT_PUBLIC_BASE_URL ||
-    process.env.WORKER_BASE_URL || "";
+    process.env.WORKER_BASE_URL ||
+    "";
   if (!origin) {
     throw new Error(
-      "Set one of INTERNAL_BASE_URL / NEXT_PUBLIC_BASE_URL / WORKER_BASE_URL for the worker."
+      "Set INTERNAL_BASE_URL (or NEXT_PUBLIC_BASE_URL / WORKER_BASE_URL) for the worker."
     );
   }
   return origin.replace(/\/$/, "");
 }
 
-// Build headers
-function headers(extra?: Record<string, string>) {
-  const h: Record<string, string> = {
+function headers(extra) {
+  const h = {
     "cache-control": "no-store",
     pragma: "no-cache",
     "user-agent": "pow-worker/1.0",
@@ -47,28 +46,20 @@ function windowInfo(nowMs = Date.now()) {
   return { idx, start, end, prepAt, snapAt, cycleId };
 }
 
-async function fetchJson(
-  url: string,
-  init: RequestInit = {},
-  timeoutMs = 15_000
-): Promise<{ ok: boolean; status: number; json: any }> {
+async function fetchJson(url, init = {}, timeoutMs = 15000) {
   const ctrl = new AbortController();
   const to = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { ...init, signal: ctrl.signal });
-    let j: any = null;
-    try {
-      j = await r.json();
-    } catch {}
+    let j = null;
+    try { j = await r.json(); } catch {}
     return { ok: r.ok, status: r.status, json: j };
   } finally {
     clearTimeout(to);
   }
 }
 
-// ===== Tasks =====
-async function ensurePrepare(cycleId: string, base: string, untilMs: number) {
-  // Keep trying until success or we hit “untilMs” (typically snapshot time minus a small buffer)
+async function ensurePrepare(cycleId, base, untilMs) {
   let attempt = 0;
   while (Date.now() < untilMs) {
     attempt++;
@@ -77,7 +68,7 @@ async function ensurePrepare(cycleId: string, base: string, untilMs: number) {
       headers: headers(),
     });
     if (ok) {
-      const step = json?.step || "ok";
+      const step = (json && json.step) || "ok";
       if (step === "already-prepared" || step === "complete" || step === "claimed-zero") {
         console.log(`[worker] prepare-drop ${cycleId}: ${step}`);
         return true;
@@ -85,14 +76,13 @@ async function ensurePrepare(cycleId: string, base: string, untilMs: number) {
     } else {
       console.warn(`[worker] prepare-drop ${cycleId} failed (status ${status})`, json);
     }
-    await sleep(Math.min(1500 * attempt, 5000)); // backoff, cap 5s
+    await sleep(Math.min(1500 * attempt, 5000));
   }
   console.error(`[worker] prepare-drop ${cycleId} not confirmed before snapshot window`);
   return false;
 }
 
-async function ensureSnapshot(cycleId: string, base: string, snapAt: number) {
-  // Try from snapAt until snapAt+grace, looping on "pending" or transient errors
+async function ensureSnapshot(cycleId, base, snapAt) {
   const deadline = snapAt + SNAP_GRACE_MS;
   let attempt = 0;
 
@@ -108,29 +98,27 @@ async function ensureSnapshot(cycleId: string, base: string, snapAt: number) {
       continue;
     }
 
-    const st = json?.status;
+    const st = json && json.status;
     if (st === "taken") {
       console.log(`[worker] snapshot ${cycleId}: taken`);
       return true;
     }
     if (st === "pending") {
-      // Too early; wait until snapAt (or short sleep if already past)
       const now = Date.now();
       const wait = Math.max(50, Math.min(500, snapAt - now));
       await sleep(wait);
       continue;
     }
     if (st === "missed") {
-      console.error(`[worker] snapshot ${cycleId}: missed (by ${json?.missedByMs}ms)`);
+      console.error(`[worker] snapshot ${cycleId}: missed (by ${json && json.missedByMs}ms)`);
       return false;
     }
     if (st === "error") {
-      console.warn(`[worker] snapshot ${cycleId}: route error`, json?.message);
+      console.warn(`[worker] snapshot ${cycleId}: route error`, json && json.message);
       await sleep(Math.min(1000 * attempt, 3000));
       continue;
     }
 
-    // Unknown but not fatal → small backoff
     await sleep(Math.min(500 * attempt, 1500));
   }
 
@@ -138,16 +126,16 @@ async function ensureSnapshot(cycleId: string, base: string, snapAt: number) {
   return false;
 }
 
-// ===== Main loop =====
-async function main() {
+(async function main() {
   const base = baseUrl();
   console.log(`[worker] booting. base=${base}, cycle=${CYCLE_MINUTES}m, jitter=${JITTER_MS}ms`);
   await sleep(JITTER_MS);
 
-  // Optional warm-up tick to catch “in-grace” startup
+  // Startup catch-up: if we boot inside grace, try snapshot immediately
   {
     const { snapAt, cycleId } = windowInfo();
-    if (Date.now() >= snapAt && Date.now() <= snapAt + SNAP_GRACE_MS) {
+    const now = Date.now();
+    if (now >= snapAt && now <= snapAt + SNAP_GRACE_MS) {
       console.log(`[worker] startup inside grace → attempting immediate snapshot for ${cycleId}`);
       await ensureSnapshot(cycleId, base, snapAt);
     }
@@ -155,29 +143,22 @@ async function main() {
 
   while (true) {
     const now = Date.now();
-    const { start, end, prepAt, snapAt, cycleId } = windowInfo(now);
+    const { end, prepAt, snapAt, cycleId } = windowInfo(now);
 
-    // === Phase A: wait until t-2m then ensure prepare-drop ===
-    if (now < prepAt) {
-      await sleep(Math.max(0, prepAt - now - 50)); // wake ~50ms before
-    }
-    // Keep trying prepare until just before snapshot time
+    // Phase A: wait until t-2m, then ensure prepare-drop
+    if (now < prepAt) await sleep(Math.max(0, prepAt - now - 50));
     await ensurePrepare(cycleId, base, snapAt - 500);
 
-    // === Phase B: wait until t-8s then ensure snapshot (within grace) ===
+    // Phase B: wait until t-8s, then ensure snapshot (within grace)
     let now2 = Date.now();
-    if (now2 < snapAt) {
-      await sleep(Math.max(0, snapAt - now2 - 30)); // wake ~30ms before
-    }
+    if (now2 < snapAt) await sleep(Math.max(0, snapAt - now2 - 30));
     await ensureSnapshot(cycleId, base, snapAt);
 
-    // === Phase C: small idle until window end, then loop ===
+    // Phase C: idle until window end
     const after = Date.now();
     if (after < end + 200) await sleep(end + 200 - after);
   }
-}
-
-main().catch((e) => {
+})().catch((e) => {
   console.error("[worker] fatal:", e);
   process.exit(1);
 });
