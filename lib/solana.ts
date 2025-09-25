@@ -1,4 +1,6 @@
 // lib/solana.ts
+import "server-only";
+
 import {
   Connection,
   PublicKey,
@@ -50,7 +52,7 @@ export function pubkeyFromEnv(varName: string): PublicKey {
   return new PublicKey(s);
 }
 
-/** Detect whether a mint uses Token-2020 or Token-2022 (by account owner) */
+/** Detect whether a mint uses Token-2022 (by account owner) or classic Token-2020 */
 export async function getMintTokenProgramId(conn: Connection, mint: PublicKey): Promise<PublicKey> {
   const info = await conn.getAccountInfo(mint, "confirmed");
   if (!info) throw new Error("Mint not found on-chain");
@@ -158,8 +160,6 @@ export async function buildClaimTx(opts: {
 
 /**
  * Server-side helper: add treasury signature AFTER wallet signed first, then send+confirm.
- * - `walletSignedB64` must contain the wallet's signature already.
- * - This function signs with the treasury keypair and broadcasts.
  */
 export async function finalizeAndSendClaimTx(opts: {
   conn: Connection;
