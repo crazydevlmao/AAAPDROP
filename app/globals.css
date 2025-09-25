@@ -1,0 +1,141 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base theme */
+:root {
+  --bg: #0e0e11;          /* dark grey */
+  --panel: #16161c;       /* card panels */
+  --accent: #00FFC2;      /* accent for CTAs */
+  --accent-dim: #00cfa0;
+  --text: #ffffff;
+}
+
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+
+/* === Animated grid: smooth + always visible === */
+/* Grid layer */
+.grid-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+
+  /* neutral grid lines */
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,0.07) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.07) 1px, transparent 1px);
+  background-size: 46px 46px;          /* a touch tighter for visibility */
+  background-position: 0 0, 0 0;
+
+  opacity: .20;                        /* slightly more visible */
+  animation:
+    gridPan 60s linear infinite,        /* smooth endless pan */
+    gridPulse 10s ease-in-out infinite; /* breathing opacity */
+}
+
+/* Gentle vignette for depth (separate so grid stays visible even if mask unsupported) */
+.grid-vignette {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(1000px 600px at 50% -10%, rgba(0,0,0,0.35), transparent 70%),
+    linear-gradient(180deg, rgba(0,0,0,0.0), rgba(0,0,0,0.35));
+}
+
+/* Motion keys (background-position is more reliable than transform for fixed layers) */
+@keyframes gridPan {
+  0%   { background-position:    0px    0px,    0px    0px; }
+  50%  { background-position:  240px  240px,  240px  240px; }
+  100% { background-position:    0px    0px,    0px    0px; }
+}
+@keyframes gridPulse {
+  0%, 100% { opacity: .20; }
+  50%      { opacity: .24; }
+}
+
+/* Components */
+.card { @apply rounded-2xl p-5 border border-[#222] bg-[var(--panel)] transition-all duration-200; }
+.card:hover { transform: translateY(-2px); box-shadow: 0 10px 24px rgba(0,0,0,0.25); }
+
+.badge { @apply text-[11px] uppercase tracking-wider opacity-60; }
+
+/* Gradient text helper (for timer) */
+.text-gradient {
+  background: linear-gradient(90deg, #c7c7c7, #f1f1f1);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Wiggle attention helper (for How it works) */
+.wiggle-2s { animation: wiggle 2s ease-in-out infinite; }
+@keyframes wiggle {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  10% { transform: translateY(-1px) rotate(-0.4deg); }
+  20% { transform: translateY(1px) rotate(0.4deg); }
+  30% { transform: translateY(-1px) rotate(-0.3deg); }
+  40% { transform: translateY(1px) rotate(0.3deg); }
+  50% { transform: translateY(0) rotate(0deg); }
+  60% { transform: translateY(-0.5px) rotate(0.2deg); }
+  70% { transform: translateY(0.5px) rotate(-0.2deg); }
+  80% { transform: translateY(-0.5px) rotate(0.1deg); }
+  90% { transform: translateY(0.5px) rotate(-0.1deg); }
+}
+
+/* === Additions: Enhanced Claim Button === */
+.btn-claim{
+  position:relative;
+  border-radius:18px;
+  padding:22px 28px;
+  font-weight:800;
+  font-size:clamp(1.1rem, 2.6vw, 1.6rem);
+  color:#061915;
+  border:1px solid var(--accent-dim);
+  background: linear-gradient(120deg, var(--accent) 0%, #aaffee 50%, var(--accent) 100%);
+  background-size: 200% 200%;
+  animation: sheen 6s linear infinite;
+  box-shadow: 0 0 22px rgba(0,255,194,0.22);
+}
+.btn-claim.pulse{
+  animation: sheen 6s linear infinite, glowPulse 2s ease-in-out infinite;
+}
+@keyframes sheen{
+  0%{ background-position: 0% 50% }
+  50%{ background-position: 100% 50% }
+  100%{ background-position: 0% 50% }
+}
+@keyframes glowPulse{
+  0%,100%{ box-shadow: 0 0 18px rgba(0,255,194,0.18) }
+  50%{ box-shadow: 0 0 28px rgba(0,255,194,0.36) }
+}
+.btn-claim.disabled{
+  background:#2a2a33; color:#868699; border:1px solid #2f2f3a; box-shadow:none; animation:none;
+}
+
+/* === Additions: Timer Progress Bar === */
+.timer-wrap{
+  width: min(720px, 92vw);
+  margin-inline: auto;
+}
+.timer-rail{
+  height:14px; border-radius:999px; overflow:hidden;
+  background: #1a1a22; border:1px solid #2a2a33;
+}
+.timer-fill{
+  height:100%; width:0%;
+  background: linear-gradient(90deg, #9aa0a6, #e5e7eb);
+  transition: width .3s linear;
+}
+.timer-label{
+  font-weight:800; font-size:clamp(2rem, 8vw, 3rem);
+  background: linear-gradient(180deg,#f5f7fa,#cfd3da);
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+}
