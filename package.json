@@ -27,9 +27,9 @@
     "typescript": "^5.4.5"
   }
 }
-{
-  "scripts": {
-    "worker": "tsx worker/scheduler.ts"
-  }
+"scripts": {
+  "worker": "node worker/scheduler.js"
 }
+
+
 
