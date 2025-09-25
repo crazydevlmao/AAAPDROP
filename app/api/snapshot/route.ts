@@ -1,4 +1,3 @@
-// app/api/snapshot/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -17,17 +16,15 @@ const GRACE_AFTER_MS = 90_000;  // allow up to 90s late
 const WINDOW_MS = CYCLE_MINUTES * 60_000;
 
 // ============ UTILS ============
-const noStoreHeaders = {
+const noStoreHeaders: Record<string, string> = {
   "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
-  pragma: "no-cache",
-  expires: "0",
 };
 
 function sha256Hex(s: string) {
   return crypto.createHash("sha256").update(s).digest("hex");
 }
 
-function baseUrl(req: Request) {
+function baseUrl(req: any) {
   if (process.env.INTERNAL_BASE_URL) return process.env.INTERNAL_BASE_URL.replace(/\/$/, "");
   if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, "");
   const u = new URL(req.url);
@@ -65,21 +62,16 @@ async function writeSnapshotIdempotent(row: {
   eligibleCount: number;
   holdersHash: string;
 }) {
-  // Preferred: single upsert
   if ((db as any).snapshot?.upsert) {
     return (db as any).snapshot.upsert({
       where: { cycleId: row.cycleId },
-      update: {}, // nothing to update post-creation
+      update: {},
       create: row,
     });
   }
-
-  // Custom helper
   if (typeof (db as any).addSnapshot === "function") {
     return (db as any).addSnapshot(row);
   }
-
-  // Fallback: try create; on unique error, just read it back
   if ((db as any).snapshot?.create) {
     try {
       return await (db as any).snapshot.create({ data: row });
@@ -87,29 +79,21 @@ async function writeSnapshotIdempotent(row: {
       return await readSnapshot(row.cycleId);
     }
   }
-
   throw new Error("No snapshot writer available on db");
 }
 
-async function addEntitlementsIdempotent(entRows: Array<{ snapshotId: string; wallet: string; amount: number; claimed: boolean }>) {
+async function addEntitlementsIdempotent(
+  entRows: Array<{ snapshotId: string; wallet: string; amount: number; claimed: boolean }>
+) {
   if (!entRows.length) return;
-
-  // Best (Prisma): createMany skipDuplicates
   if ((db as any).entitlement?.createMany) {
-    await (db as any).entitlement.createMany({
-      data: entRows,
-      skipDuplicates: true, // requires UNIQUE(snapshotId, wallet)
-    });
+    await (db as any).entitlement.createMany({ data: entRows, skipDuplicates: true });
     return;
   }
-
-  // Custom helper that should de-dup internally (preferred)
   if (typeof (db as any).addEntitlements === "function") {
-    await (db as any).addEntitlements(entRows); // ideally ON CONFLICT DO NOTHING
+    await (db as any).addEntitlements(entRows);
     return;
   }
-
-  // Fallback: per-row upsert if available
   if ((db as any).entitlement?.upsert) {
     for (const r of entRows) {
       await (db as any).entitlement.upsert({
@@ -120,20 +104,15 @@ async function addEntitlementsIdempotent(entRows: Array<{ snapshotId: string; wa
     }
     return;
   }
-
-  // Last resort: naive create in a loop (safe only if DB has UNIQUE constraint)
   if ((db as any).entitlement?.create) {
-    for (const r of entRows) {
-      try { await (db as any).entitlement.create({ data: r }); } catch {}
-    }
+    for (const r of entRows) { try { await (db as any).entitlement.create({ data: r }); } catch {} }
     return;
   }
-
   throw new Error("No entitlement writer available on db");
 }
 
 // ============ ROUTE ============
-export async function GET(req: Request) {
+export async function GET(req: any) {
   try {
     const now = Date.now();
     const { start, end, snapshotAt, cycleId } = windowInfo(now);
@@ -156,7 +135,7 @@ export async function GET(req: Request) {
       );
     }
 
-    // 1) Too early → pending with ETA
+    // 1) Too early → pending
     if (now < snapshotAt) {
       return NextResponse.json(
         { status: "pending", cycleId, window: { start, end, snapshotAt }, etaMs: snapshotAt - now },
@@ -166,12 +145,8 @@ export async function GET(req: Request) {
 
     // 2) Due or within grace → TAKE it (idempotent)
     if (now <= snapshotAt + GRACE_AFTER_MS) {
-      // Pull holders (UI route is fine; worker version can call Helius directly)
       const origin = baseUrl(req);
-      const r = await fetch(`${origin}/api/holders?ts=${Date.now()}`, {
-        cache: "no-store",
-        headers: noStoreHeaders,
-      });
+      const r = await fetch(`${origin}/api/holders?ts=${Date.now()}`, { cache: "no-store" });
       if (!r.ok) throw new Error(`holders fetch failed: ${r.status}`);
       const { holders = [] } = (await r.json()) as { holders: Holder[] };
 
@@ -179,27 +154,22 @@ export async function GET(req: Request) {
       const eligibleCount = eligible.length;
       const totalBal = eligible.reduce((a, b) => a + (b.balance || 0), 0);
 
-      // Read PREP for THIS cycle (your accounting)
       const prep = await (db as any).getPrep?.(cycleId);
       const cyclePump = Math.max(0, Number(prep?.acquiredPump || 0));
       const allocPump = cyclePump * 0.95;
 
-      // Compute entitlements
       const entRows: Array<{ snapshotId: string; wallet: string; amount: number; claimed: boolean }> = [];
       if (allocPump > 0 && totalBal > 0) {
         for (const h of eligible) {
           const share = (h.balance / totalBal) * allocPump;
-          if (share > 0) {
-            entRows.push({ snapshotId, wallet: h.wallet.toLowerCase(), amount: share, claimed: false });
-          }
+          if (share > 0) entRows.push({ snapshotId, wallet: h.wallet.toLowerCase(), amount: share, claimed: false });
         }
       }
 
-      // Persist snapshot first (idempotent), then entitlements
       const holdersHash = sha256Hex(JSON.stringify({ eligible }, null, 0));
       const snapshotTs = new Date().toISOString();
 
-      const snapRow = await writeSnapshotIdempotent({
+      await writeSnapshotIdempotent({
         cycleId,
         snapshotId,
         snapshotTs,
@@ -208,7 +178,6 @@ export async function GET(req: Request) {
         holdersHash,
       });
 
-      // If another writer won the race, snapRow may be the existing row.
       await addEntitlementsIdempotent(entRows);
 
       return NextResponse.json(
@@ -228,7 +197,7 @@ export async function GET(req: Request) {
       );
     }
 
-    // 3) Beyond grace → declare missed (optional backfill hook lives here)
+    // 3) Beyond grace → missed
     return NextResponse.json(
       { status: "missed", cycleId, window: { start, end, snapshotAt }, missedByMs: now - snapshotAt },
       { status: 202, headers: noStoreHeaders }
