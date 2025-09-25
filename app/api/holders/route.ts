@@ -15,7 +15,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
 
-type HolderRow = { wallet: string; balance: number };
+type HolderRow = { wallet: string; balance: number; display?: string };
 
 let cache:
   | {
@@ -81,11 +81,14 @@ async function collectBalancesForProgram(
   programId: PublicKey
 ): Promise<Map<string, bigint> & { __display?: Map<string, string> }> {
   const parsed = await conn.getParsedProgramAccounts(programId, {
-    filters: [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }],
+    filters: [
+      { memcmp: { offset: 0, bytes: mintPk.toBase58() } },
+      // Optional: dataSize could be used (165), but some RPCs omit it on parsed route; keep it simple.
+    ],
     commitment: "processed",
   });
 
-  // Attach a display map to preserve first-seen original-case addresses
+  // lc -> raw balance; and lc -> original-case address
   const perOwner = new Map<string, bigint>() as Map<
     string,
     bigint
@@ -96,8 +99,13 @@ async function collectBalancesForProgram(
     try {
       const acc = parsed[i];
       const data = acc.account.data as ParsedAccountData;
-      if (data?.program !== "spl-token") continue;
-      const info: any = data.parsed?.info;
+      if (
+        !data ||
+        (data.program !== "spl-token" && data.program !== "spl-token-2022")
+      ) {
+        continue;
+      }
+      const info: any = (data as any).parsed?.info;
       const owner: string | undefined = info?.owner;
       const amountStr: string | undefined = info?.tokenAmount?.amount;
       if (!owner || !amountStr) continue;
@@ -108,7 +116,6 @@ async function collectBalancesForProgram(
       const keyLc = owner.toLowerCase();
       const prev = perOwner.get(keyLc) ?? BigInt(0);
       perOwner.set(keyLc, prev + amt);
-
       if (!perOwner.__display!.has(keyLc)) perOwner.__display!.set(keyLc, owner);
     } catch {
       // ignore a bad row
@@ -161,10 +168,11 @@ export async function GET() {
 
     for (let i = 0; i < maps.length; i++) {
       const m = maps[i];
+
       m.forEach((amt, lc) => {
-        const prev = perOwner.get(lc) ?? BigInt(0);
-        perOwner.set(lc, prev + amt);
+        perOwner.set(lc, (perOwner.get(lc) ?? BigInt(0)) + amt);
       });
+
       const disp = m.__display;
       if (disp) {
         disp.forEach((d, lc) => {
@@ -181,8 +189,9 @@ export async function GET() {
       if (blacklist.has(lc)) return;
       const walletDisplay = display.get(lc) ?? lc;
       holders.push({
-        wallet: walletDisplay, // original case for UI/links
+        wallet: walletDisplay,     // original case for UI & Solscan links
         balance: Number(raw) / denom,
+        display: walletDisplay,    // explicit for your current page.tsx fallback
       });
     });
 
