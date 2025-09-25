@@ -2,10 +2,10 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
+export const fetchCache = "force-no-store"; // NEW: avoid cache confusion
 
 import { NextResponse } from "next/server";
 
-// OPTIONAL: if your internal routes expect extra params, tweak here.
 const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
 const PREP_OFFSET_SECONDS = Number(process.env.PREP_OFFSET_SECONDS || 120);
 const SNAPSHOT_OFFSET_SECONDS = Number(process.env.SNAPSHOT_OFFSET_SECONDS || 8);
@@ -20,6 +20,12 @@ function nextBoundary(minutes = CYCLE_MINUTES, from = new Date()) {
   return d;
 }
 
+// NEW: robust origin resolver (same host as this /api/tick)
+function originFromReq(req: Request) {
+  const u = new URL(req.url);
+  return `${u.protocol}//${u.host}`;
+}
+
 let lastCycleKeyPrep = "";      // in-memory de-dupe (Render keeps process hot)
 let lastCycleKeySnapshot = "";
 
@@ -30,44 +36,41 @@ export async function GET(req: Request) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
+  const origin = originFromReq(req);
   const now = new Date();
   const boundary = nextBoundary(CYCLE_MINUTES, now); // next cut
-  const msLeft = +boundary - +now;                   // ms until next cut
-  const sLeft = Math.floor(msLeft / 1000);
+  const sLeft = Math.max(0, Math.floor((+boundary - +now) / 1000));
   const cycleKey = boundary.toISOString().slice(0, 16); // e.g. 2025-09-24T20:10
 
   const actions: string[] = [];
 
-  // PREP window (trigger once per cycle)
-  if (
-    sLeft <= PREP_OFFSET_SECONDS &&
-    sLeft >= PREP_OFFSET_SECONDS - 10 &&      // allow cron slop
-    lastCycleKeyPrep !== cycleKey
-  ) {
+  // ==== PREP window ====
+  // BEFORE: 10s window often missed with 1-min cron.
+  // NOW: fire once anytime in the last PREP_OFFSET_SECONDS (default 120s).
+  if (sLeft <= PREP_OFFSET_SECONDS && lastCycleKeyPrep !== cycleKey) {
     actions.push("prepare-drop");
     lastCycleKeyPrep = cycleKey;
     try {
-      await fetch(new URL("/api/prepare-drop", req.url).toString(), { method: "POST", cache: "no-store" });
+      await fetch(`${origin}/api/prepare-drop`, { method: "POST", cache: "no-store" });
     } catch {}
   }
 
-  // SNAPSHOT window (trigger once per cycle)
-  if (
-    sLeft <= SNAPSHOT_OFFSET_SECONDS + 10 &&  // allow cron slop
-    sLeft >= Math.max(0, SNAPSHOT_OFFSET_SECONDS - 10) &&
-    lastCycleKeySnapshot !== cycleKey
-  ) {
+  // ==== SNAPSHOT window ====
+  // BEFORE: ±10s around SNAPSHOT_OFFSET_SECONDS (8s) — very easy to miss.
+  // NOW: fire once in the last max(30s, SNAPSHOT_OFFSET_SECONDS) — safe for 1-min cron.
+  const snapshotWindow = Math.max(30, SNAPSHOT_OFFSET_SECONDS);
+  if (sLeft <= snapshotWindow && lastCycleKeySnapshot !== cycleKey) {
     actions.push("snapshot");
     lastCycleKeySnapshot = cycleKey;
 
     // Build snapshot URL (match your page.tsx params)
-    const u = new URL("/api/snapshot", req.url);
+    const u = new URL(`${origin}/api/snapshot`);
     if (process.env.NEXT_PUBLIC_COIN_MINT) u.searchParams.set("mint", process.env.NEXT_PUBLIC_COIN_MINT);
     u.searchParams.set("min", "10000");
     if (process.env.NEXT_PUBLIC_BLACKLIST || process.env.NEXT_PUBLIC_PUMPFUN_AMM) {
       const list = [
         ...(process.env.NEXT_PUBLIC_BLACKLIST || "").split(",").map(s => s.trim()).filter(Boolean),
-        (process.env.NEXT_PUBLIC_PUMPFUN_AMM || "").trim()
+        (process.env.NEXT_PUBLIC_PUMPFUN_AMM || "").trim(),
       ].filter(Boolean).join(",");
       if (list) u.searchParams.set("blacklist", list);
     }
@@ -82,6 +85,7 @@ export async function GET(req: Request) {
     now: now.toISOString(),
     secondsLeft: sLeft,
     actionsFired: actions,
-    cycle: cycleKey
+    cycle: cycleKey,
+    snapshotWindow,
   }, { headers: { "cache-control": "no-store" } });
 }
