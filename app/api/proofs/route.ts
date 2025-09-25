@@ -5,102 +5,172 @@ export const revalidate = 0;
 export const fetchCache = "force-no-store";
 
 import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
-import { connection } from "@/lib/solana";
+import { connection, pubkeyFromEnv, PUMP_MINT } from "@/lib/solana";
+import { PublicKey, Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
 
-const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
-const WINDOW_MS = CYCLE_MINUTES * 60_000;
+function n(v: any) { const x = Number(v); return Number.isFinite(x) ? x : 0; }
 
-function cycleIdAt(ms: number) {
-  const idx = Math.floor(ms / WINDOW_MS);
-  const end = (idx * WINDOW_MS) + WINDOW_MS;
-  return String(end);
+async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<number> {
+  const conn = connection();
+  const tx = await conn.getTransaction(sig, {
+    maxSupportedTransactionVersion: 0,
+    commitment: "confirmed",
+  });
+  if (!tx?.meta) return 0;
+  const keys = tx.transaction.message.getAccountKeys().staticAccountKeys;
+  const i = keys.findIndex(k => k.equals(target));
+  if (i < 0) return 0;
+  const pre = tx.meta.preBalances?.[i] ?? 0;
+  const post = tx.meta.postBalances?.[i] ?? 0;
+  const deltaLamports = post - pre;
+  return deltaLamports / 1e9;
 }
-function cycleIdMinus(cycleId: string, windows: number) {
-  return String(Number(cycleId) - windows * WINDOW_MS);
+
+async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
+  const conn = connection();
+  const tx = await conn.getTransaction(sig, {
+    maxSupportedTransactionVersion: 0,
+    commitment: "confirmed",
+  });
+  if (!tx?.meta) return 0;
+
+  const pre = tx.meta.preTokenBalances || [];
+  const post = tx.meta.postTokenBalances || [];
+
+  const mintStr = PUMP_MINT.toBase58();
+  const ownerLc = owner.toBase58().toLowerCase();
+
+  const preMap = new Map<string, number>(); // accountIndex -> preRaw
+  for (const p of pre) {
+    if (p.mint === mintStr && (p as any).owner?.toLowerCase() === ownerLc) {
+      preMap.set(String(p.accountIndex), Number(p.uiTokenAmount?.amount || 0));
+    }
+  }
+  let deltaRaw = 0;
+  for (const q of post) {
+    if (q.mint === mintStr && (q as any).owner?.toLowerCase() === ownerLc) {
+      const key = String(q.accountIndex);
+      const preAmt = preMap.get(key) ?? 0;
+      const postAmt = Number(q.uiTokenAmount?.amount || 0);
+      deltaRaw += (postAmt - preAmt);
+    }
+  }
+  return deltaRaw / 1e6; // UI units for PUMP (6 decimals)
 }
-async function readPrep(cycleId: string) {
-  try { return await (db as any).getPrep?.(cycleId); } catch { return null; }
-}
-async function readSnapshot(cycleId: string) {
-  try {
-    if (typeof (db as any).getSnapshot === "function") return await (db as any).getSnapshot(cycleId);
-    if ((db as any).snapshot?.findUnique) return await (db as any).snapshot.findUnique({ where: { cycleId } });
-  } catch {}
+
+async function readLatestSnapshot(db: any) {
+  if (db?.snapshot?.findFirst) {
+    return db.snapshot.findFirst({ orderBy: { cycleId: "desc" } });
+  }
+  if (db?.getLatestSnapshot) return db.getLatestSnapshot();
+  if (db?.snapshot?.findMany) {
+    const rows = await db.snapshot.findMany({ orderBy: { cycleId: "desc" }, take: 1 });
+    return rows?.[0] || null;
+  }
   return null;
+}
+
+async function readPreviousSnapshots(db: any, limit = 5) {
+  if (db?.snapshot?.findMany) {
+    const rows = await db.snapshot.findMany({ orderBy: { cycleId: "desc" }, skip: 1, take: limit });
+    return rows;
+  }
+  if (db?.listSnapshots) return db.listSnapshots(limit);
+  return [];
+}
+
+function resolveDevPub(): PublicKey {
+  try {
+    return pubkeyFromEnv("DEV_WALLET");
+  } catch {}
+  const sec = process.env.DEV_WALLET_SECRET?.trim();
+  if (sec) {
+    const kp = Keypair.fromSecretKey(bs58.decode(sec));
+    return kp.publicKey;
+  }
+  throw new Error("Missing DEV_WALLET or DEV_WALLET_SECRET");
 }
 
 export async function GET() {
   try {
-    const now = Date.now();
-    const current = cycleIdAt(now);
+    const { db } = await import("@/lib/db");
+    const treasury = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
+    const devPub = resolveDevPub();
 
-    // find the most recent cycle that HAS a snapshot
-    let snapCycle: string | null = null;
-    let snap: any = null;
-    for (const back of [0, 1, 2, 3, 4]) {
-      const cid = back === 0 ? current : cycleIdMinus(current, back);
-      const s = await readSnapshot(cid);
-      if (s) { snapCycle = cid; snap = s; break; }
+    // latest snapshot
+    const snap = await readLatestSnapshot(db);
+    if (!snap) {
+      return NextResponse.json({
+        snapshotId: null,
+        snapshotTs: null,
+        snapshotHash: null,
+        pumpBalance: 0,
+        deltaPump: 0,
+        creatorSol: 0,
+        pumpSwapped: 0,
+        txs: {},
+        previous: [],
+      }, { headers: { "cache-control": "no-store" } });
     }
 
-    // If we truly have no snapshots yet, fall back to current/prep-only
-    const pickedCycle = snapCycle || current;
-    const prep = await readPrep(pickedCycle);
+    const snapshotId = snap?.snapshotId ?? null;
+    const snapshotTs = snap?.snapshotTs ?? null;
+    const deltaPump = n(snap?.deltaPump); // UI units
 
-    // optional: safety — if claimSig exists but is not collect_creator_fee, hide it
-    let claimSig: string | null = prep?.claimSig || null;
-    if (claimSig) {
-      try {
-        const conn = connection("confirmed");
-        const tx = await conn.getTransaction(claimSig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-        const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
-        const ok = logs.some(l => l.toLowerCase().includes("collect_creator_fee"));
-        if (!ok) claimSig = null;
-      } catch {
-        // if inspection fails, leave as-is; prepare-drop already verified
-      }
-    }
+    // prep row for this cycle
+    const prep: any = db?.getPrep ? await db.getPrep(snap?.cycleId || "") : null;
 
-    const body = {
-      snapshotId: snap?.snapshotId ?? pickedCycle,
-      snapshotTs: snap?.snapshotTs ?? null,
-      snapshotHash: snap?.holdersHash ?? snap?.snapshotHash ?? "",
-      pumpBalance: typeof snap?.deltaPump === "number" ? snap.deltaPump : 0, // Delta $PUMP (allocated this cycle)
-      creatorSol: typeof prep?.creatorSolDelta === "number" ? prep.creatorSolDelta : 0, // Creator rewards (SOL)
-      pumpSwapped: typeof prep?.acquiredPump === "number" ? prep.acquiredPump : 0,      // $PUMP swapped
+    const claimSig: string | null = (prep?.claimSig) ?? null;
+    const swapSig: string | null =
+      (prep?.swapSigTreas) ??
+      ((Array.isArray(prep?.swapSigs) && prep.swapSigs.length > 0) ? prep.swapSigs[0] : null) ??
+      null;
+
+    // chain-derived amounts
+    const creatorSol = claimSig ? await lamportsToSolFromTx(claimSig, devPub) : 0;
+    const pumpSwapped = swapSig ? await pumpDeltaFromTx(swapSig, treasury) : 0;
+
+    const previous = await readPreviousSnapshots(db, 5);
+
+    return NextResponse.json({
+      snapshotId,
+      snapshotTs,
+      snapshotHash: snap?.holdersHash || null,
+      pumpBalance: deltaPump,
+      deltaPump,
+
+      creatorSol,
+      pumpSwapped,
+
       txs: {
-        claimSig, // only if verified/kept
-        swapSig: prep?.swapSigTreas || (Array.isArray(prep?.swapSigs) ? prep.swapSigs[0] : null),
+        claimSig: claimSig || null,
+        swapSig: swapSig || null,
       },
-      previous: [] as any[],
-    };
 
-    // Build previous list (up to 5)
-    let cursor = pickedCycle;
-    for (let i = 0; i < 5; i++) {
-      cursor = cycleIdMinus(cursor, 1);
-      const p = await readPrep(cursor);
-      const s = await readSnapshot(cursor);
-      if (!p && !s) continue;
-      body.previous.push({
-        snapshotId: s?.snapshotId ?? cursor,
-        snapshotTs: s?.snapshotTs ?? null,
-        snapshotHash: s?.holdersHash ?? s?.snapshotHash ?? "",
-        pumpBalance: typeof s?.deltaPump === "number" ? s.deltaPump : 0,
-        creatorSol: typeof p?.creatorSolDelta === "number" ? p.creatorSolDelta : 0,
-        pumpSwapped: typeof p?.acquiredPump === "number" ? p.acquiredPump : 0,
-        txs: {
-          claimSig: p?.claimSig || null,
-          swapSig: p?.swapSigTreas || (Array.isArray(p?.swapSigs) ? p.swapSigs[0] : null),
-        },
-        csv: s?.csv || null,
-      });
-    }
-
-    return NextResponse.json(body);
+      previous: (previous || []).map((p: any) => ({
+        snapshotId: p.snapshotId,
+        snapshotTs: p.snapshotTs,
+        snapshotHash: p.holdersHash,
+        deltaPump: n(p.deltaPump),
+        pumpBalance: n(p.deltaPump),
+        creatorSol: 0,
+        pumpSwapped: 0,
+        txs: p.txs || {},
+      })),
+    }, { headers: { "cache-control": "no-store" } });
   } catch (e: any) {
-    console.error("proofs error:", e);
-    return NextResponse.json({ error: String(e?.message || e) }, { status: 500 });
+    console.error("proofs route error:", e);
+    return NextResponse.json({
+      snapshotId: null,
+      snapshotTs: null,
+      snapshotHash: null,
+      pumpBalance: 0,
+      deltaPump: 0,
+      creatorSol: 0,
+      pumpSwapped: 0,
+      txs: {},
+      previous: [],
+    }, { headers: { "cache-control": "no-store" } });
   }
 }

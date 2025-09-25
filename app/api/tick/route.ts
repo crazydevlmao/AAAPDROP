@@ -1,89 +1,87 @@
+// app/api/tick/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
-export const fetchCache = "force-no-store";
 
 import { NextResponse } from "next/server";
 
-/** Build a prod-safe origin */
-function originFrom(req: any) {
-  if (process.env.INTERNAL_BASE_URL) return process.env.INTERNAL_BASE_URL.replace(/\/$/, "");
-  if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, "");
-  const u = new URL(req.url);
-  return `${u.protocol}//${u.host}`;
+// OPTIONAL: if your internal routes expect extra params, tweak here.
+const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
+const PREP_OFFSET_SECONDS = Number(process.env.PREP_OFFSET_SECONDS || 120);
+const SNAPSHOT_OFFSET_SECONDS = Number(process.env.SNAPSHOT_OFFSET_SECONDS || 8);
+const CRON_SECRET = process.env.CRON_SECRET || ""; // set this in Render
+
+function nextBoundary(minutes = CYCLE_MINUTES, from = new Date()) {
+  const d = new Date(from);
+  d.setSeconds(0, 0);
+  const m = d.getMinutes();
+  const r = m % minutes;
+  d.setMinutes(r ? m + (minutes - r) : m + minutes);
+  return d;
 }
 
-/** Default APIs to ping. Add more via TICK_EXTRA_PATHS (comma-separated) */
-function pathsToPing(): string[] {
-  const defaults = ["/api/snapshot", "/api/holders"];
-  const extra = (process.env.TICK_EXTRA_PATHS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((p) => (p.startsWith("/") ? p : `/${p}`));
-  return Array.from(new Set([...defaults, ...extra]));
-}
+let lastCycleKeyPrep = "";      // in-memory de-dupe (Render keeps process hot)
+let lastCycleKeySnapshot = "";
 
-function trimBodyForLog(body: any) {
-  try {
-    const s = JSON.stringify(body);
-    if (s.length <= 600) return body;
-    return { note: "truncated", preview: s.slice(0, 600) };
-  } catch {
-    return { note: "non-json-or-empty-body" };
-  }
-}
-
-export async function GET(req: any) {
-  const startAll = Date.now();
-  const u = new URL(req.url);
-
-  // Optional shared-secret ?token=...
-  const token = u.searchParams.get("token");
-  if (process.env.TICK_TOKEN && token !== process.env.TICK_TOKEN) {
+export async function GET(req: Request) {
+  // Simple auth so randos can't spam your tick
+  const key = req.headers.get("x-cron-key") || "";
+  if (!CRON_SECRET || key !== CRON_SECRET) {
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });
   }
 
-  const base = originFrom(req);
-  const ts = Date.now();
+  const now = new Date();
+  const boundary = nextBoundary(CYCLE_MINUTES, now); // next cut
+  const msLeft = +boundary - +now;                   // ms until next cut
+  const sLeft = Math.floor(msLeft / 1000);
+  const cycleKey = boundary.toISOString().slice(0, 16); // e.g. 2025-09-24T20:10
 
-  const targets = pathsToPing();
+  const actions: string[] = [];
 
-  const results = await Promise.allSettled(
-    targets.map(async (path) => {
-      const url = `${base}${path}?ts=${ts}`;
-      const t0 = Date.now();
-      try {
-        const r = await fetch(url, { cache: "no-store" });
-        const dur = Date.now() - t0;
+  // PREP window (trigger once per cycle)
+  if (
+    sLeft <= PREP_OFFSET_SECONDS &&
+    sLeft >= PREP_OFFSET_SECONDS - 10 &&      // allow cron slop
+    lastCycleKeyPrep !== cycleKey
+  ) {
+    actions.push("prepare-drop");
+    lastCycleKeyPrep = cycleKey;
+    try {
+      await fetch(new URL("/api/prepare-drop", req.url).toString(), { method: "POST", cache: "no-store" });
+    } catch {}
+  }
 
-        let body: any;
-        try { body = await r.json(); } catch { body = { note: "non-json-or-empty-body" }; }
+  // SNAPSHOT window (trigger once per cycle)
+  if (
+    sLeft <= SNAPSHOT_OFFSET_SECONDS + 10 &&  // allow cron slop
+    sLeft >= Math.max(0, SNAPSHOT_OFFSET_SECONDS - 10) &&
+    lastCycleKeySnapshot !== cycleKey
+  ) {
+    actions.push("snapshot");
+    lastCycleKeySnapshot = cycleKey;
 
-        return {
-          path,
-          status: r.status,
-          ok: r.ok,
-          ms: dur,
-          body: trimBodyForLog(body),
-        };
-      } catch (e: any) {
-        const dur = Date.now() - t0;
-        return { path, status: 0, ok: false, ms: dur, error: String(e) };
-      }
-    })
-  );
+    // Build snapshot URL (match your page.tsx params)
+    const u = new URL("/api/snapshot", req.url);
+    if (process.env.NEXT_PUBLIC_COIN_MINT) u.searchParams.set("mint", process.env.NEXT_PUBLIC_COIN_MINT);
+    u.searchParams.set("min", "10000");
+    if (process.env.NEXT_PUBLIC_BLACKLIST || process.env.NEXT_PUBLIC_PUMPFUN_AMM) {
+      const list = [
+        ...(process.env.NEXT_PUBLIC_BLACKLIST || "").split(",").map(s => s.trim()).filter(Boolean),
+        (process.env.NEXT_PUBLIC_PUMPFUN_AMM || "").trim()
+      ].filter(Boolean).join(",");
+      if (list) u.searchParams.set("blacklist", list);
+    }
 
-  const flattened = results.map((res, i) =>
-    res.status === "fulfilled"
-      ? res.value
-      : { path: targets[i], ok: false, status: 0, ms: 0, error: String(res.reason) }
-  );
+    try {
+      await fetch(u.toString(), { cache: "no-store" });
+    } catch {}
+  }
 
-  const anyOk = flattened.some((r) => r.ok);
-
-  return NextResponse.json(
-    { ok: anyOk, totalMs: Date.now() - startAll, hits: flattened },
-    { status: anyOk ? 200 : 202, headers: { "cache-control": "no-store" } }
-  );
+  return NextResponse.json({
+    ok: true,
+    now: now.toISOString(),
+    secondsLeft: sLeft,
+    actionsFired: actions,
+    cycle: cycleKey
+  }, { headers: { "cache-control": "no-store" } });
 }

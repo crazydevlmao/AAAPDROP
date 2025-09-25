@@ -1,188 +1,154 @@
 // lib/solana.ts
-import "server-only";
-
 import {
   Connection,
   PublicKey,
   Keypair,
+  clusterApiUrl,
+  ComputeBudgetProgram,
+  TransactionMessage,
+  VersionedTransaction,
   SystemProgram,
   LAMPORTS_PER_SOL,
-  VersionedTransaction,
-  TransactionMessage,
-  MessageV0,
-  clusterApiUrl,
-  Commitment,
 } from "@solana/web3.js";
 import {
-  getAssociatedTokenAddress,
-  createAssociatedTokenAccountInstruction,
-  createTransferCheckedInstruction,
   TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferCheckedInstruction,
 } from "@solana/spl-token";
-import bs58 from "bs58";
 
-/** $PUMP mint (6 decimals) */
-export const PUMP_MINT = new PublicKey("pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn");
-const DECIMALS = 6;
+// $PUMP mint (override with NEXT_PUBLIC_PUMP_MINT if needed)
+export const PUMP_MINT = new PublicKey(
+  process.env.NEXT_PUBLIC_PUMP_MINT ?? "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+);
 
-/** Connection using your env (HELIUS/SOLANA) */
-export function connection(commitment: Commitment = "confirmed") {
-  const rpc =
-    process.env.HELIUS_RPC ||
-    process.env.SOLANA_RPC ||
+export function connection() {
+  const url =
     process.env.NEXT_PUBLIC_SOLANA_RPC ||
+    process.env.SOLANA_RPC ||
     clusterApiUrl("mainnet-beta");
-  return new Connection(rpc, commitment);
+  return new Connection(url, "confirmed");
 }
 
-/** Read keypair from base58 secret in env (server-side only) */
-export function keypairFromEnv(varName: string): Keypair {
-  const sec = process.env[varName];
-  if (!sec) throw new Error(`Missing ${varName}`);
-  const bytes = bs58.decode(sec.trim());
-  return Keypair.fromSecretKey(bytes);
+/**
+ * Read a keypair from env in either JSON (array) or base58 formats.
+ * e.g. JSON: "[12,34,...]"   or   base58: "3AbC...".
+ */
+export function keypairFromEnv(name: string): Keypair {
+  const raw = process.env[name];
+  if (!raw) throw new Error(`Missing ${name}`);
+  let secret: Uint8Array;
+  try {
+    const arr = JSON.parse(raw);
+    secret = Uint8Array.from(arr);
+  } catch {
+    // not JSON → assume base58
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const bs58 = require("bs58");
+    secret = bs58.decode(raw.trim());
+  }
+  return Keypair.fromSecretKey(secret);
 }
 
-/** Read pubkey from env */
-export function pubkeyFromEnv(varName: string): PublicKey {
-  const s = process.env[varName];
-  if (!s) throw new Error(`Missing ${varName}`);
-  return new PublicKey(s);
+export function pubkeyFromEnv(name: string) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return new PublicKey(v);
 }
 
-/** Detect whether a mint uses Token-2022 or classic Token-2020 */
-export async function getMintTokenProgramId(conn: Connection, mint: PublicKey): Promise<PublicKey> {
+/**
+ * Detect whether a mint is Token-2022 or classic by reading the account owner.
+ */
+export async function getMintTokenProgramId(
+  conn: Connection,
+  mint: PublicKey
+): Promise<PublicKey> {
   const info = await conn.getAccountInfo(mint, "confirmed");
-  if (!info) throw new Error("Mint not found on-chain");
-  const owner = info.owner?.toBase58();
+  const owner = info?.owner?.toBase58?.() ?? "";
   if (owner === TOKEN_2022_PROGRAM_ID.toBase58()) return TOKEN_2022_PROGRAM_ID;
+  // default to classic if unknown
   return TOKEN_PROGRAM_ID;
 }
 
 /**
- * Build an **UNSIGNED** v0 transaction for the user to sign FIRST (Phantom-safe).
+ * Build an UNSIGNED claim tx where the USER is the FEE PAYER.
+ * Includes a fixed 0.01 SOL fee paid to teamWallet.
+ * Phantom signs first; server co-signs with treasury and broadcasts.
  */
 export async function buildClaimTx(opts: {
   conn: Connection;
-  treasuryPubkey: PublicKey;
-  user: PublicKey;
-  amountPump: number;
-  teamWallet: PublicKey;
-  tokenProgramId?: PublicKey;
-}): Promise<{ txB64: string; amount: number; feeSol: number; lastValidBlockHeight: number; blockhash: string }> {
-  const { conn, treasuryPubkey, user, amountPump, teamWallet } = opts;
-  const tokenProgramId = opts.tokenProgramId || TOKEN_PROGRAM_ID;
+  treasuryPubkey: PublicKey; // server signer added later
+  user: PublicKey;           // fee payer (Phantom)
+  amountPump: number;        // UI units
+  teamWallet: PublicKey;     // receives the 0.01 SOL fee
+  tokenProgramId: PublicKey;
+}) {
+  const { conn, treasuryPubkey, user, amountPump, teamWallet, tokenProgramId } = opts;
 
-  // Convert UI → raw
-  const multiplier = Math.pow(10, DECIMALS);
-  const raw = Math.floor(amountPump * multiplier);
-  if (!Number.isFinite(raw) || raw <= 0) throw new Error("Invalid amount");
+  const decimals = 6;
+  const raw = Math.floor(amountPump * 10 ** decimals); // number OK for checked transfer
 
-  // Derive ATAs under the correct token program
-  const treasuryAta = await getAssociatedTokenAddress(
-    PUMP_MINT,
-    treasuryPubkey,
-    false,
-    tokenProgramId,
-    ASSOCIATED_TOKEN_PROGRAM_ID
-  );
-  const userAta = await getAssociatedTokenAddress(
-    PUMP_MINT,
-    user,
-    false,
-    tokenProgramId,
-    ASSOCIATED_TOKEN_PROGRAM_ID
-  );
+  const fromAta = getAssociatedTokenAddressSync(PUMP_MINT, treasuryPubkey, false, tokenProgramId);
+  const toAta   = getAssociatedTokenAddressSync(PUMP_MINT, user,           false, tokenProgramId);
 
-  const ixs = [];
+  // 0.01 SOL team fee (override with CLAIM_FEE_SOL env if needed)
+  const CLAIM_FEE_SOL = Number(process.env.CLAIM_FEE_SOL ?? "0.01");
+  const feeLamports = Math.max(1, Math.floor(CLAIM_FEE_SOL * LAMPORTS_PER_SOL));
 
-  // Create user's ATA if missing (payer = user)
-  const acctInfo = await conn.getAccountInfo(userAta, "confirmed");
-  if (!acctInfo) {
-    ixs.push(
-      createAssociatedTokenAccountInstruction(
-        user,
-        userAta,
-        user,
-        PUMP_MINT,
-        tokenProgramId,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      )
-    );
-  }
+  const ixs = [
+    // generous budget to avoid CU throttles on busy slots
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
 
-  // TransferChecked (Treasury -> User)
-  ixs.push(
-    createTransferCheckedInstruction(
-      treasuryAta,
+    // ensure TREASURY's ATA exists (payer = user; owner signature not required)
+    createAssociatedTokenAccountIdempotentInstruction(
+      user,            // payer
+      fromAta,         // ATA to create if missing
+      treasuryPubkey,  // owner of ATA
       PUMP_MINT,
-      userAta,
-      treasuryPubkey,
+      tokenProgramId
+    ),
+
+    // ensure USER's ATA exists (payer = user)
+    createAssociatedTokenAccountIdempotentInstruction(
+      user,   // payer
+      toAta,  // ATA to create if missing
+      user,   // owner
+      PUMP_MINT,
+      tokenProgramId
+    ),
+
+    // 0.01 SOL fee to team wallet (signed by the user / fee payer)
+    SystemProgram.transfer({
+      fromPubkey: user,
+      toPubkey: teamWallet,
+      lamports: feeLamports,
+    }),
+
+    // transfer from TREASURY_ATA -> USER_ATA (requires treasury signature later)
+    createTransferCheckedInstruction(
+      fromAta,
+      PUMP_MINT,
+      toAta,
+      treasuryPubkey, // authority that will partialSign server-side
       raw,
-      DECIMALS,
+      decimals,
       [],
       tokenProgramId
-    )
-  );
+    ),
+  ];
 
-  // 0.01 SOL fee from user -> team
-  const feeLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
-  if (feeLamports > 0) {
-    ixs.push(
-      SystemProgram.transfer({
-        fromPubkey: user,
-        toPubkey: teamWallet,
-        lamports: feeLamports,
-      })
-    );
-  }
-
-  // Build message with user as fee payer
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
+  const { blockhash } = await conn.getLatestBlockhash("finalized");
   const msg = new TransactionMessage({
     payerKey: user,
     recentBlockhash: blockhash,
     instructions: ixs,
   }).compileToV0Message();
 
-  const tx = new VersionedTransaction(msg as MessageV0);
-
-  // Wallet must sign FIRST
-  const txB64 = Buffer.from(tx.serialize()).toString("base64");
-  return { txB64, amount: amountPump, feeSol: 0.01, lastValidBlockHeight, blockhash };
-}
-
-/**
- * Server-side helper: add treasury signature AFTER wallet signed first, then send+confirm.
- */
-export async function finalizeAndSendClaimTx(opts: {
-  conn: Connection;
-  walletSignedB64: string;
-  treasuryKp: Keypair;
-  commitment?: Commitment;
-  skipPreflight?: boolean;
-}): Promise<{ signature: string }> {
-  const { conn, walletSignedB64, treasuryKp } = opts;
-  const commitment: Commitment = opts.commitment ?? "confirmed";
-
-  // Deserialize wallet-signed tx
-  const tx = VersionedTransaction.deserialize(Buffer.from(walletSignedB64, "base64"));
-
-  // Add treasury signature (v0 API)
-  tx.sign([treasuryKp]);
-
-  // Send
-  const sig = await conn.sendRawTransaction(tx.serialize(), {
-    skipPreflight: opts.skipPreflight ?? false,
-    preflightCommitment: commitment,
-  });
-
-  // ✅ Confirm with a full strategy to satisfy all typings
-  // Use the latest blockhash context for confirmation.
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
-  await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, commitment);
-
-  return { signature: sig };
+  const unsigned = new VersionedTransaction(msg);
+  return {
+    txB64: Buffer.from(unsigned.serialize()).toString("base64"),
+    amount: amountPump,
+    feeSol: CLAIM_FEE_SOL,
+  };
 }

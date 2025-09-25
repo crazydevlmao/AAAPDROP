@@ -20,7 +20,7 @@ function pickRpc() {
   return (
     process.env.HELIUS_RPC ||
     process.env.SOLANA_RPC ||
-    process.env.NEXT_PUBLIC_SOLANA_RPC || // ← add frontend RPC as server fallback
+    process.env.NEXT_PUBLIC_SOLANA_RPC ||
     "https://api.mainnet-beta.solana.com"
   );
 }
@@ -51,7 +51,6 @@ async function fetchMintDecimals(conn: Connection, mintPk: PublicKey): Promise<n
     const d = Number(sup?.value?.decimals);
     if (Number.isFinite(d)) return d;
   } catch {}
-  // safe fallback
   return 6;
 }
 
@@ -75,7 +74,21 @@ async function collectClassicBinary(
 
   for (let i = 0; i < accs.length; i++) {
     try {
-      const decoded = AccountLayout.decode(accs[i].account.data);
+      // Ensure Uint8Array for strict TS envs (Buffer → Uint8Array view)
+      const raw = accs[i].account.data as unknown as Uint8Array;
+      const u8 =
+        raw instanceof Uint8Array
+          ? raw
+          : new Uint8Array(
+              // @ts-ignore - handle Buffer at runtime
+              raw.buffer ?? raw,
+              // @ts-ignore
+              raw.byteOffset ?? 0,
+              // @ts-ignore
+              raw.byteLength ?? raw.length ?? undefined
+            );
+
+      const decoded = AccountLayout.decode(u8);
       const owner = new PublicKey(decoded.owner).toBase58();
       const amount = BigInt(decoded.amount.toString());
       if (amount <= BigInt(0)) continue;
@@ -84,7 +97,7 @@ async function collectClassicBinary(
       per.set(lc, (per.get(lc) ?? BigInt(0)) + amount);
       if (!per.__display!.has(lc)) per.__display!.set(lc, owner);
     } catch {
-      // ignore one bad row
+      /* ignore a bad row */
     }
   }
   return per;
@@ -97,7 +110,6 @@ async function collectParsed(
   programId: PublicKey
 ): Promise<Map<string, bigint> & { __display?: Map<string, string> }> {
   const parsed = await conn.getParsedProgramAccounts(programId, {
-    // no dataSize for 2022; sizes vary. memcmp on mint still works.
     filters: [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }],
     commitment: "processed",
   });
@@ -122,7 +134,7 @@ async function collectParsed(
       per.set(lc, (per.get(lc) ?? BigInt(0)) + amt);
       if (!per.__display!.has(lc)) per.__display!.set(lc, owner);
     } catch {
-      // ignore one bad row
+      /* ignore a bad row */
     }
   }
   return per;
@@ -150,11 +162,8 @@ export async function GET(req: Request) {
 
     // Build from three sources (two for classic, one for 2022) then merge:
     const maps: (Map<string, bigint> & { __display?: Map<string, string> })[] = [];
-    // Classic fast path (binary)
     try { maps.push(await collectClassicBinary(conn, mintPk)); } catch {}
-    // Classic parsed (backup)
     try { maps.push(await collectParsed(conn, mintPk, TOKEN_PROGRAM_ID)); } catch {}
-    // Token-2022 parsed
     try { maps.push(await collectParsed(conn, mintPk, TOKEN_2022_PROGRAM_ID)); } catch {}
 
     const perOwner = new Map<string, bigint>();
