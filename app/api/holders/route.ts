@@ -85,14 +85,16 @@ async function collectBalancesForProgram(
     commitment: "processed",
   });
 
+  // Attach a display map to preserve first-seen original-case addresses
   const perOwner = new Map<string, bigint>() as Map<
     string,
     bigint
   > & { __display?: Map<string, string> };
   perOwner.__display = new Map<string, string>();
 
-  for (const acc of parsed) {
+  for (let i = 0; i < parsed.length; i++) {
     try {
+      const acc = parsed[i];
       const data = acc.account.data as ParsedAccountData;
       if (data?.program !== "spl-token") continue;
       const info: any = data.parsed?.info;
@@ -157,30 +159,32 @@ export async function GET() {
     const perOwner = new Map<string, bigint>();
     const display = new Map<string, string>(); // lc -> original-case
 
-    for (const m of maps) {
-      for (const [lc, amt] of m.entries()) {
-        perOwner.set(lc, (perOwner.get(lc) ?? BigInt(0)) + amt);
-      }
+    for (let i = 0; i < maps.length; i++) {
+      const m = maps[i];
+      m.forEach((amt, lc) => {
+        const prev = perOwner.get(lc) ?? BigInt(0);
+        perOwner.set(lc, prev + amt);
+      });
       const disp = m.__display;
       if (disp) {
-        for (const [lc, d] of disp.entries()) {
+        disp.forEach((d, lc) => {
           if (!display.has(lc)) display.set(lc, d);
-        }
+        });
       }
     }
 
     const blacklist = parseBlacklist();
 
     const holders: HolderRow[] = [];
-    for (const [lc, raw] of perOwner.entries()) {
-      if (raw < minRaw) continue;
-      if (blacklist.has(lc)) continue;
+    perOwner.forEach((raw, lc) => {
+      if (raw < minRaw) return;
+      if (blacklist.has(lc)) return;
       const walletDisplay = display.get(lc) ?? lc;
       holders.push({
         wallet: walletDisplay, // original case for UI/links
         balance: Number(raw) / denom,
       });
-    }
+    });
 
     holders.sort((a, b) => b.balance - a.balance);
 
