@@ -1,4 +1,4 @@
-// app/api/prepare-drop/route.ts (or wherever this lives)
+// app/api/prepare-drop/route.ts
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
@@ -119,7 +119,8 @@ async function jupSwap(conn: Connection, signer: Keypair, quoteResp: any) {
   const tx = VersionedTransaction.deserialize(txBytes);
   tx.sign([signer]);
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await conn.confirmTransaction(sig, "confirmed");
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
+  await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
   return sig;
 }
 function requireSecret(req: Request) {
@@ -164,8 +165,6 @@ export async function POST(req: Request) {
     // ===== Idempotency guard: if already prepared for this cycle, exit =====
     const existing = await db.getPrep(thisCycle);
     if (existing && existing.status === "ok") {
-      // If we’ve already prepared (swap or at least recorded split), don’t do it again.
-      // Treat acquiredPump > 0 OR any tx present as prepared.
       if (existing.acquiredPump > 0 || existing.swapSigTreas || existing.teamSig || existing.treasuryMoveSig) {
         return NextResponse.json(
           { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
