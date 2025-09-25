@@ -59,17 +59,19 @@ async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
   return deltaRaw / 1e6; // UI units for PUMP (6 decimals)
 }
 
+// use your file-DB API
 async function readLatestSnapshot(db: any) {
+  if (typeof db?.latestSnapshot === "function") return db.latestSnapshot();
   if (db?.snapshot?.findFirst) {
     return db.snapshot.findFirst({ orderBy: { cycleId: "desc" } });
   }
-  if (db?.getLatestSnapshot) return db.getLatestSnapshot();
   if (db?.snapshot?.findMany) {
     const rows = await db.snapshot.findMany({ orderBy: { cycleId: "desc" }, take: 1 });
     return rows?.[0] || null;
   }
   return null;
 }
+
 
 async function readPreviousSnapshots(db: any, limit = 5) {
   if (db?.snapshot?.findMany) {
@@ -174,3 +176,4 @@ export async function GET() {
     }, { headers: { "cache-control": "no-store" } });
   }
 }
+
