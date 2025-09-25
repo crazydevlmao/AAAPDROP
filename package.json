@@ -1,10 +1,13 @@
 {
   "name": "pumpdrop",
   "private": true,
+  "version": "1.0.0",
+  "engines": { "node": "20.x" },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "worker": "node worker/scheduler.js"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.8",
@@ -27,11 +30,3 @@
     "typescript": "^5.4.5"
   }
 }
-"scripts": {
-  "worker": "node worker/scheduler.js"
-}
-"engines": { "node": "20.x" }
-
-
-
-
