@@ -12,19 +12,13 @@ import {
   AccountLayout,
 } from "@solana/spl-token";
 
-/** ====== In-memory cache (per process) ====== */
+/** ===== In-memory cache ===== */
 let cache:
-  | {
-      at: number; // ms
-      data: { holders: Array<{ wallet: string; balance: number }> };
-    }
+  | { at: number; data: { holders: Array<{ wallet: string; balance: number }> } }
   | null = null;
 
-// Short cache so UI (polling every ~10s) sees near real-time updates
 const TTL_MS = 2000;
-
-/** ====== Utils ====== */
-const COMMITMENT: Commitment = "confirmed"; // fresher than finalized, more stable than processed
+const COMMITMENT: Commitment = "confirmed";
 
 function pickRpc() {
   return (
@@ -46,7 +40,6 @@ function parseBlacklist(): Set<string> {
   return set;
 }
 
-/** Robustly read decimals: try legacy program first, then Token-2022 */
 async function fetchMintDecimals(conn: Connection, mintPk: PublicKey): Promise<number> {
   try {
     const mi = await getMint(conn, mintPk, COMMITMENT, TOKEN_PROGRAM_ID);
@@ -56,37 +49,52 @@ async function fetchMintDecimals(conn: Connection, mintPk: PublicKey): Promise<n
     const mi = await getMint(conn, mintPk, COMMITMENT, TOKEN_2022_PROGRAM_ID);
     if (typeof mi.decimals === "number") return mi.decimals;
   } catch {}
-  // Fallback (most Pump tokens are 6 or 9; use 6 if unknown)
   return 6;
 }
 
-/** Scan one token program (legacy or 2022) and aggregate raw balances per owner */
-async function scanProgramAccounts(
+// Legacy SPL (fixed 165-byte accounts)
+async function scanLegacy(
   conn: Connection,
-  mintPk: PublicKey,
-  programId: PublicKey
+  mintPk: PublicKey
 ): Promise<Map<string, bigint>> {
   const perOwner = new Map<string, bigint>();
-
-  const accounts = await conn.getProgramAccounts(programId, {
+  const accounts = await conn.getProgramAccounts(TOKEN_PROGRAM_ID, {
     filters: [
-      { dataSize: 165 }, // SPL token account size
-      { memcmp: { offset: 0, bytes: mintPk.toBase58() } }, // mint at offset 0
+      { dataSize: 165 },
+      { memcmp: { offset: 0, bytes: mintPk.toBase58() } },
     ],
     commitment: COMMITMENT,
   });
-
   for (const acc of accounts) {
     try {
       const data = AccountLayout.decode(acc.account.data);
       const owner = new PublicKey(data.owner).toBase58().toLowerCase();
       const amt = BigInt(data.amount.toString());
-      if (amt > 0n) {
-        perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
-      }
-    } catch {
-      // ignore malformed
-    }
+      if (amt > 0n) perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
+    } catch {}
+  }
+  return perOwner;
+}
+
+// Token-2022 (TLV); use parsed accounts (no 165 filter)
+async function scanToken2022(
+  conn: Connection,
+  mintPk: PublicKey
+): Promise<Map<string, bigint>> {
+  const perOwner = new Map<string, bigint>();
+  const parsed = await conn.getParsedProgramAccounts(TOKEN_2022_PROGRAM_ID, {
+    filters: [{ memcmp: { offset: 0, bytes: mintPk.toBase58() } }],
+    commitment: COMMITMENT,
+  });
+  for (const item of parsed) {
+    try {
+      const info: any = (item.account.data as any).parsed?.info;
+      if (!info) continue;
+      const owner = String(info.owner || "").toLowerCase();
+      const rawStr = info.tokenAmount?.amount ?? "0";
+      const amt = BigInt(rawStr);
+      if (owner && amt > 0n) perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
+    } catch {}
   }
   return perOwner;
 }
@@ -100,35 +108,27 @@ export async function GET() {
       });
     }
 
-    const MINT_STR =
-      process.env.NEXT_PUBLIC_COIN_MINT || process.env.COIN_MINT || "";
+    const MINT_STR = process.env.NEXT_PUBLIC_COIN_MINT || process.env.COIN_MINT || "";
     if (!MINT_STR) {
       return NextResponse.json({ holders: [] }, { headers: { "cache-control": "no-store" } });
     }
 
     const mintPk = new PublicKey(MINT_STR);
     const conn = new Connection(pickRpc(), COMMITMENT);
-
-    // Decimals (robust across both programs)
     const decimals = await fetchMintDecimals(conn, mintPk);
 
-    // Minimum threshold raw units for >= 10,000
     const tenK = 10_000;
     const minRaw = BigInt(Math.floor(tenK * Math.pow(10, decimals)));
 
-    // Scan both programs in parallel and merge
     const [legacy, tok2022] = await Promise.all([
-      scanProgramAccounts(conn, mintPk, TOKEN_PROGRAM_ID).catch(() => new Map<string, bigint>()),
-      scanProgramAccounts(conn, mintPk, TOKEN_2022_PROGRAM_ID).catch(() => new Map<string, bigint>()),
+      scanLegacy(conn, mintPk).catch(() => new Map<string, bigint>()),
+      scanToken2022(conn, mintPk).catch(() => new Map<string, bigint>()),
     ]);
 
     const perOwner = new Map<string, bigint>();
-    // merge legacy first
     for (const [k, v] of legacy.entries()) perOwner.set(k, (perOwner.get(k) ?? 0n) + v);
-    // then add token2022
     for (const [k, v] of tok2022.entries()) perOwner.set(k, (perOwner.get(k) ?? 0n) + v);
 
-    // Filter & map to UI balances
     const blacklist = parseBlacklist();
     const holders = Array.from(perOwner.entries())
       .filter(([owner, raw]) => raw >= minRaw && !blacklist.has(owner))
@@ -141,9 +141,7 @@ export async function GET() {
     const data = { holders };
     cache = { at: now, data };
 
-    return NextResponse.json(data, {
-      headers: { "cache-control": "no-store" },
-    });
+    return NextResponse.json(data, { headers: { "cache-control": "no-store" } });
   } catch (e) {
     console.error("holders route error:", e);
     return NextResponse.json(
