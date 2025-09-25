@@ -52,13 +52,13 @@ export function pubkeyFromEnv(varName: string): PublicKey {
   return new PublicKey(s);
 }
 
-/** Detect whether a mint uses Token-2022 (by account owner) or classic Token-2020 */
+/** Detect whether a mint uses Token-2022 or classic Token-2020 */
 export async function getMintTokenProgramId(conn: Connection, mint: PublicKey): Promise<PublicKey> {
   const info = await conn.getAccountInfo(mint, "confirmed");
   if (!info) throw new Error("Mint not found on-chain");
   const owner = info.owner?.toBase58();
   if (owner === TOKEN_2022_PROGRAM_ID.toBase58()) return TOKEN_2022_PROGRAM_ID;
-  return TOKEN_PROGRAM_ID; // default to classic
+  return TOKEN_PROGRAM_ID;
 }
 
 /**
@@ -173,14 +173,16 @@ export async function finalizeAndSendClaimTx(opts: {
   // Add treasury signature (v0 API)
   tx.sign([treasuryKp]);
 
-  // Send & confirm
+  // Send
   const sig = await conn.sendRawTransaction(tx.serialize(), {
     skipPreflight: opts.skipPreflight ?? false,
     preflightCommitment: commitment,
   });
 
-  // ✅ Use string overload to satisfy typings across web3 versions
-  await conn.confirmTransaction(sig, commitment);
+  // ✅ Confirm with a full strategy to satisfy all typings
+  // Use the latest blockhash context for confirmation.
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
+  await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, commitment);
 
   return { signature: sig };
 }
