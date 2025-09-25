@@ -45,9 +45,10 @@ function parseBlacklist(): Set<string> {
 
 /** BigInt-safe: 10_000 * 10^decimals in raw/base units */
 function minRawThreshold(decimals: number): bigint {
-  const tenPow = 10n ** BigInt(Math.max(0, decimals | 0));
-  return 10_000n * tenPow;
+  const tenPow = BigInt(Math.floor(Math.pow(10, Math.max(0, decimals | 0))));
+  return BigInt(10_000) * tenPow;
 }
+
 
 async function fetchHoldersForProgram(
   conn: Connection,
@@ -150,3 +151,4 @@ export async function GET() {
     );
   }
 }
+
