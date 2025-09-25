@@ -2,11 +2,8 @@
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import {
-  Connection,
-  PublicKey,
-} from "@solana/web3.js";
-import { getMint, getAccount, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getMint, TOKEN_PROGRAM_ID, AccountLayout } from "@solana/spl-token";
 
 // in-memory cache
 let cache: {
@@ -14,10 +11,14 @@ let cache: {
   data: { holders: Array<{ wallet: string; balance: number }> };
 } | null = null;
 
-const TTL_MS = 10_000;
+const TTL_MS = 2000; // shorter cache for near real-time updates
 
 function pickRpc() {
-  return process.env.HELIUS_RPC || process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
+  return (
+    process.env.HELIUS_RPC ||
+    process.env.SOLANA_RPC ||
+    "https://api.mainnet-beta.solana.com"
+  );
 }
 
 function parseBlacklist(): Set<string> {
@@ -36,7 +37,9 @@ export async function GET() {
   try {
     const now = Date.now();
     if (cache && now - cache.at < TTL_MS) {
-      return NextResponse.json(cache.data, { headers: { "cache-control": "no-store" } });
+      return NextResponse.json(cache.data, {
+        headers: { "cache-control": "no-store" },
+      });
     }
 
     const MINT_STR =
@@ -46,7 +49,7 @@ export async function GET() {
     }
     const mintPk = new PublicKey(MINT_STR);
     const rpc = pickRpc();
-    const conn = new Connection(rpc, "confirmed");
+    const conn = new Connection(rpc, "processed"); // 👈 faster reflection
 
     // read mint to get decimals
     const mintInfo = await getMint(conn, mintPk);
@@ -57,29 +60,25 @@ export async function GET() {
     const accounts = await conn.getProgramAccounts(TOKEN_PROGRAM_ID, {
       filters: [
         { dataSize: 165 }, // Token account size
-        // Mint filter at offset 0x0..32
-        { memcmp: { offset: 0, bytes: mintPk.toBase58() } },
+        { memcmp: { offset: 0, bytes: mintPk.toBase58() } }, // Mint filter
       ],
-      commitment: "confirmed",
+      commitment: "processed",
     });
 
-    // Aggregate balances per owner
-const perOwner = new Map<string, bigint>();
-for (const acc of accounts) {
-  try {
-    // Each acc.account.data is raw token account bytes; parse via SPL helper
-    const tokenAcc = await getAccount(conn, acc.pubkey);
-    if (!tokenAcc.owner) continue;
-    const owner = tokenAcc.owner.toBase58().toLowerCase();
-    const amt = BigInt(tokenAcc.amount.toString());
-    if (amt > BigInt(0)) {
-      perOwner.set(owner, (perOwner.get(owner) ?? BigInt(0)) + amt); // ✅ fixed
+    // Aggregate balances per owner (decode directly)
+    const perOwner = new Map<string, bigint>();
+    for (const acc of accounts) {
+      try {
+        const data = AccountLayout.decode(acc.account.data);
+        const owner = new PublicKey(data.owner).toBase58().toLowerCase();
+        const amt = BigInt(data.amount.toString());
+        if (amt > 0n) {
+          perOwner.set(owner, (perOwner.get(owner) ?? 0n) + amt);
+        }
+      } catch {
+        // ignore malformed accounts
+      }
     }
-  } catch {
-    // ignore malformed accounts
-  }
-}
-
 
     // Filter: >= 10k, exclude AMM/blacklist, and convert to UI units
     const blacklist = parseBlacklist();
@@ -93,7 +92,10 @@ for (const acc of accounts) {
 
     const data = { holders };
     cache = { at: now, data };
-    return NextResponse.json(data, { headers: { "cache-control": "no-store" } });
+
+    return NextResponse.json(data, {
+      headers: { "cache-control": "no-store" },
+    });
   } catch (e) {
     console.error("holders route error:", e);
     return NextResponse.json({ holders: [] });
