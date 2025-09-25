@@ -1,3 +1,4 @@
+// app/api/prepare-drop/route.ts (or wherever this lives)
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
@@ -30,6 +31,8 @@ const MIN_DEV_BUFFER_SOL =
     : 0.004;
 
 const PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
+
+const noStore = { "cache-control": "no-store, no-cache, must-revalidate, max-age=0" };
 
 /* =================== Helpers =================== */
 function pickRpc() {
@@ -152,11 +155,24 @@ export async function POST(req: Request) {
     const TREASURY_SECRET = process.env.TREASURY_SECRET?.trim();
     const TREASURY_KP = TREASURY_SECRET ? kpFromBase58(TREASURY_SECRET) : null;
     if (!TREASURY_KP) {
-      return NextResponse.json({ ok: false, error: "Missing TREASURY_SECRET; required to swap in Treasury." }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Missing TREASURY_SECRET; required to swap in Treasury." }, { status: 400, headers: noStore });
     }
 
     const conn = new Connection(pickRpc(), "confirmed");
     const thisCycle = cycleIdNow();
+
+    // ===== Idempotency guard: if already prepared for this cycle, exit =====
+    const existing = await db.getPrep(thisCycle);
+    if (existing && existing.status === "ok") {
+      // If we’ve already prepared (swap or at least recorded split), don’t do it again.
+      // Treat acquiredPump > 0 OR any tx present as prepared.
+      if (existing.acquiredPump > 0 || existing.swapSigTreas || existing.teamSig || existing.treasuryMoveSig) {
+        return NextResponse.json(
+          { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
+          { headers: noStore }
+        );
+      }
+    }
 
     /* 1) Claim */
     const preSolDev = await getSolBalance(conn, DEV.publicKey);
@@ -188,7 +204,7 @@ export async function POST(req: Request) {
         toSwapUi: 0,
         swapOutPumpUi: 0,
       });
-      return NextResponse.json({ ok: true, step: "claimed-zero", claimSig, deltaSol });
+      return NextResponse.json({ ok: true, step: "claimed-zero", claimSig, deltaSol }, { headers: noStore });
     }
 
     /* 2) Split SOL */
@@ -232,15 +248,11 @@ export async function POST(req: Request) {
           await sleep(800);
           const quote = await jupQuote(toSwapUi, s);
           swapSigTreas = await jupSwap(conn, TREASURY_KP, quote);
-          // best-effort estimate
-          try {
-            pumpBoughtUi = Number(quote?.outAmount ?? 0) / 1e6;
-          } catch {}
+          try { pumpBoughtUi = Number(quote?.outAmount ?? 0) / 1e6; } catch {}
           break;
         } catch (e) { lastErr = e; await sleep(1200); }
       }
       if (!swapSigTreas) {
-        // still persist the split, but with 0 acquiredPump to block allocations
         await db.upsertPrep({
           cycleId: thisCycle,
           acquiredPump: 0,
@@ -258,11 +270,14 @@ export async function POST(req: Request) {
           toSwapUi,
           swapOutPumpUi: 0,
         });
-        return NextResponse.json({ ok: false, step: "treasury-swap-failed", claimSig, teamSig, treasuryMoveSig, reason: String(lastErr) }, { status: 500 });
+        return NextResponse.json(
+          { ok: false, step: "treasury-swap-failed", claimSig, teamSig, treasuryMoveSig, reason: String(lastErr) },
+          { status: 500, headers: noStore }
+        );
       }
     }
 
-    // persist prep for THIS cycle (this is what snapshot will read)
+    // persist prep for THIS cycle (snapshot will read this)
     await db.upsertPrep({
       cycleId: thisCycle,
       acquiredPump: pumpBoughtUi,
@@ -287,6 +302,7 @@ export async function POST(req: Request) {
       {
         ok: true,
         step: "complete",
+        cycleId: thisCycle,
         claimSig,
         splits: {
           toTeamSolLamports: teamLamports,
@@ -296,14 +312,15 @@ export async function POST(req: Request) {
         txs: { teamSig, treasuryMoveSig, swapSigTreas },
         notes: "PUMP now sits in Treasury; entitlements will be allocated at snapshot.",
       },
-      { headers: { "cache-control": "no-store" } }
+      { headers: noStore }
     );
   } catch (e: any) {
     console.error("prepare-drop error:", e);
-    return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500 });
+    return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500, headers: noStore });
   }
 }
 
 export async function GET(req: Request) {
+  // Keep GET as a convenience; still protected by x-drop-secret if set
   return POST(req);
 }
