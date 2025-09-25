@@ -1,4 +1,3 @@
-// app/api/tick/route.ts
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -7,7 +6,7 @@ export const fetchCache = "force-no-store";
 import { NextResponse } from "next/server";
 
 /** Build a prod-safe origin */
-function originFrom(req: Request) {
+function originFrom(req: any) {
   if (process.env.INTERNAL_BASE_URL) return process.env.INTERNAL_BASE_URL.replace(/\/$/, "");
   if (process.env.NEXT_PUBLIC_BASE_URL) return process.env.NEXT_PUBLIC_BASE_URL.replace(/\/$/, "");
   const u = new URL(req.url);
@@ -22,11 +21,20 @@ function pathsToPing(): string[] {
     .map((s) => s.trim())
     .filter(Boolean)
     .map((p) => (p.startsWith("/") ? p : `/${p}`));
-  // de-dupe
   return Array.from(new Set([...defaults, ...extra]));
 }
 
-export async function GET(req: Request) {
+function trimBodyForLog(body: any) {
+  try {
+    const s = JSON.stringify(body);
+    if (s.length <= 600) return body;
+    return { note: "truncated", preview: s.slice(0, 600) };
+  } catch {
+    return { note: "non-json-or-empty-body" };
+  }
+}
+
+export async function GET(req: any) {
   const startAll = Date.now();
   const u = new URL(req.url);
 
@@ -38,12 +46,6 @@ export async function GET(req: Request) {
 
   const base = originFrom(req);
   const ts = Date.now();
-  const headers = {
-    "cache-control": "no-store",
-    pragma: "no-cache",
-    "x-tick-ts": String(ts),
-    "user-agent": "aaapdrop-tick/1.0",
-  };
 
   const targets = pathsToPing();
 
@@ -52,28 +54,18 @@ export async function GET(req: Request) {
       const url = `${base}${path}?ts=${ts}`;
       const t0 = Date.now();
       try {
-        const r = await fetch(url, { cache: "no-store", headers });
+        const r = await fetch(url, { cache: "no-store" });
         const dur = Date.now() - t0;
-        let body: any = null;
 
-        // Try to parse JSON, but keep it small to avoid huge responses
-        try {
-          body = await r.json();
-        } catch {
-          body = { note: "non-json-or-empty-body" };
-        }
-
-        // Trim noisy fields
-        const preview = JSON.stringify(body);
-        const short =
-          preview.length > 600 ? JSON.parse(preview.slice(0, 600)) : body;
+        let body: any;
+        try { body = await r.json(); } catch { body = { note: "non-json-or-empty-body" }; }
 
         return {
           path,
           status: r.status,
           ok: r.ok,
           ms: dur,
-          body: short,
+          body: trimBodyForLog(body),
         };
       } catch (e: any) {
         const dur = Date.now() - t0;
@@ -85,20 +77,13 @@ export async function GET(req: Request) {
   const flattened = results.map((res, i) =>
     res.status === "fulfilled"
       ? res.value
-      : { path: pathsToPing()[i], ok: false, status: 0, ms: 0, error: String(res.reason) }
+      : { path: targets[i], ok: false, status: 0, ms: 0, error: String(res.reason) }
   );
 
   const anyOk = flattened.some((r) => r.ok);
 
   return NextResponse.json(
-    {
-      ok: anyOk,
-      totalMs: Date.now() - startAll,
-      hits: flattened,
-    },
-    {
-      status: anyOk ? 200 : 202, // don't cause cron deactivation on transient issues
-      headers: { "cache-control": "no-store" },
-    }
+    { ok: anyOk, totalMs: Date.now() - startAll, hits: flattened },
+    { status: anyOk ? 200 : 202, headers: { "cache-control": "no-store" } }
   );
 }
