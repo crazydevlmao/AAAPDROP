@@ -574,7 +574,7 @@ useEffect(() => {
       <div className="grid-vignette" />
 
       {/* Header */}
-      <header className="relative z-10 flex items-center justify-between px-5 py-4 max-w-6xl mx-auto">
+      <header className="relative z-[10000] flex items-center justify-between px-5 py-4 max-w-6xl mx-auto">
         <div className="w-56"><ConnectButton /></div>
         <div className="flex items-center gap-2 text-sm">
           <div className="opacity-70">CA</div>
@@ -1194,12 +1194,11 @@ function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
   const [copied, setCopied] = useState(false);
 
   async function writeClipboard(text: string) {
-    // Try modern API first
     try {
       await navigator.clipboard.writeText(text);
       return true;
     } catch {
-      // Fallback for odd browsers / blocked permissions
+      // Fallback for odd/blocked environments
       try {
         const ta = document.createElement("textarea");
         ta.value = text;
@@ -1234,15 +1233,12 @@ function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
         </span>
         <span className="font-mono text-xs truncate">{short(addr, 6, 6)}</span>
       </div>
-
       <button
         type="button"
         onClick={onCopy}
         className={`text-[11px] px-2 py-1 rounded-md border transition-all active:scale-95
-          ${copied
-            ? "border-transparent shadow"
-            : "bg-[#0c0c12] border-[#2a2a33] hover:bg-[#14141b]"}`}
-        // when "copied", force the accent green so it’s obvious
+          ${copied ? "border-transparent shadow" : "bg-[#0c0c12] border-[#2a2a33] hover:bg-[#14141b]"}`}
+        // force accent green when copied
         style={copied ? { background: "#00FFC2", color: "#061915" } : undefined}
         title="Copy address"
         aria-live="polite"
@@ -1252,6 +1248,7 @@ function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
     </div>
   );
 }
+
 
 
 function WalletStrip() {
@@ -1277,4 +1274,3 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
-
