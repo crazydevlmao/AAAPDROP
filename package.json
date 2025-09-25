@@ -30,6 +30,8 @@
 "scripts": {
   "worker": "node worker/scheduler.js"
 }
+"engines": { "node": "20.x" }
+
 
 
 
