@@ -63,18 +63,14 @@ export async function getMintTokenProgramId(conn: Connection, mint: PublicKey): 
 
 /**
  * Build an **UNSIGNED** v0 transaction for the user to sign FIRST (Phantom-safe).
- * Flow:
- *   1) Client requests/builds this.
- *   2) Wallet signs FIRST: tx = await wallet.signTransaction(tx)
- *   3) Send base64(tx) to server → server calls finalizeAndSendClaimTx() to sign with treasury & broadcast.
  */
 export async function buildClaimTx(opts: {
   conn: Connection;
-  treasuryPubkey: PublicKey;   // source owner (signer, but NOT signed here)
-  user: PublicKey;             // fee payer
-  amountPump: number;          // UI units
-  teamWallet: PublicKey;       // receives 0.01 SOL fee
-  tokenProgramId?: PublicKey;  // optional override (auto-detected if omitted)
+  treasuryPubkey: PublicKey;
+  user: PublicKey;
+  amountPump: number;
+  teamWallet: PublicKey;
+  tokenProgramId?: PublicKey;
 }): Promise<{ txB64: string; amount: number; feeSol: number; lastValidBlockHeight: number; blockhash: string }> {
   const { conn, treasuryPubkey, user, amountPump, teamWallet } = opts;
   const tokenProgramId = opts.tokenProgramId || TOKEN_PROGRAM_ID;
@@ -107,9 +103,9 @@ export async function buildClaimTx(opts: {
   if (!acctInfo) {
     ixs.push(
       createAssociatedTokenAccountInstruction(
-        user,            // payer (must have SOL)
-        userAta,         // ata to create
-        user,            // owner
+        user,
+        userAta,
+        user,
         PUMP_MINT,
         tokenProgramId,
         ASSOCIATED_TOKEN_PROGRAM_ID
@@ -117,21 +113,21 @@ export async function buildClaimTx(opts: {
     );
   }
 
-  // TransferChecked (Treasury -> User), decimals=6; REQUIRED SIGNER = treasuryPubkey
+  // TransferChecked (Treasury -> User)
   ixs.push(
     createTransferCheckedInstruction(
-      treasuryAta,          // source
-      PUMP_MINT,            // mint
-      userAta,              // destination
-      treasuryPubkey,       // owner (signer, but NOT signing here)
-      raw,                  // amount (raw)
-      DECIMALS,             // decimals
-      [],                   // multisig (none)
+      treasuryAta,
+      PUMP_MINT,
+      userAta,
+      treasuryPubkey,
+      raw,
+      DECIMALS,
+      [],
       tokenProgramId
     )
   );
 
-  // 0.01 SOL fee from user -> team (user pays + signs)
+  // 0.01 SOL fee from user -> team
   const feeLamports = Math.floor(0.01 * LAMPORTS_PER_SOL);
   if (feeLamports > 0) {
     ixs.push(
@@ -143,7 +139,7 @@ export async function buildClaimTx(opts: {
     );
   }
 
-  // Build message with user as fee payer (needs their signature)
+  // Build message with user as fee payer
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
   const msg = new TransactionMessage({
     payerKey: user,
@@ -153,7 +149,7 @@ export async function buildClaimTx(opts: {
 
   const tx = new VersionedTransaction(msg as MessageV0);
 
-  // IMPORTANT: Do NOT sign here. Wallet must sign FIRST to satisfy Phantom Lighthouse.
+  // Wallet must sign FIRST
   const txB64 = Buffer.from(tx.serialize()).toString("base64");
   return { txB64, amount: amountPump, feeSol: 0.01, lastValidBlockHeight, blockhash };
 }
@@ -163,10 +159,10 @@ export async function buildClaimTx(opts: {
  */
 export async function finalizeAndSendClaimTx(opts: {
   conn: Connection;
-  walletSignedB64: string;     // base64 tx signed by wallet FIRST
-  treasuryKp: Keypair;         // server-held signer for transfer owner
-  commitment?: Commitment;     // default "confirmed"
-  skipPreflight?: boolean;     // default false
+  walletSignedB64: string;
+  treasuryKp: Keypair;
+  commitment?: Commitment;
+  skipPreflight?: boolean;
 }): Promise<{ signature: string }> {
   const { conn, walletSignedB64, treasuryKp } = opts;
   const commitment: Commitment = opts.commitment ?? "confirmed";
@@ -174,8 +170,7 @@ export async function finalizeAndSendClaimTx(opts: {
   // Deserialize wallet-signed tx
   const tx = VersionedTransaction.deserialize(Buffer.from(walletSignedB64, "base64"));
 
-  // === Phantom-safe sign order ===
-  // Wallet has already signed; now server adds treasury signature using v0 API:
+  // Add treasury signature (v0 API)
   tx.sign([treasuryKp]);
 
   // Send & confirm
@@ -184,7 +179,8 @@ export async function finalizeAndSendClaimTx(opts: {
     preflightCommitment: commitment,
   });
 
-  await conn.confirmTransaction({ signature: sig }, commitment);
+  // ✅ Use string overload to satisfy typings across web3 versions
+  await conn.confirmTransaction(sig, commitment);
 
   return { signature: sig };
 }
