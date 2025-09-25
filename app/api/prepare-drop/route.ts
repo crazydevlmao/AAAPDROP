@@ -80,6 +80,20 @@ async function waitTreasuryIncrease(conn: Connection, treasury: PublicKey, preTr
   }
   return await getSolBalance(conn, treasury);
 }
+
+/** Only accept a tx as "creator rewards" if logs contain `collect_creator_fee`. */
+async function isCollectCreatorFee(conn: Connection, sig: string): Promise<boolean> {
+  try {
+    // string overload is fine here
+    await conn.confirmTransaction(sig, "finalized");
+    const tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "finalized" });
+    const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
+    return logs.some(l => l.toLowerCase().includes("collect_creator_fee"));
+  } catch {
+    return false;
+  }
+}
+
 async function jupQuote(solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const outputMint = PUMP_MINT;
@@ -119,8 +133,7 @@ async function jupSwap(conn: Connection, signer: Keypair, quoteResp: any) {
   const tx = VersionedTransaction.deserialize(txBytes);
   tx.sign([signer]);
   const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
-  await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+  await conn.confirmTransaction(sig, "confirmed");
   return sig;
 }
 function requireSecret(req: Request) {
@@ -162,7 +175,7 @@ export async function POST(req: Request) {
     const conn = new Connection(pickRpc(), "confirmed");
     const thisCycle = cycleIdNow();
 
-    // ===== Idempotency guard: if already prepared for this cycle, exit =====
+    // ===== Idempotency guard =====
     const existing = await db.getPrep(thisCycle);
     if (existing && existing.status === "ok") {
       if (existing.acquiredPump > 0 || existing.swapSigTreas || existing.teamSig || existing.treasuryMoveSig) {
@@ -173,17 +186,23 @@ export async function POST(req: Request) {
       }
     }
 
-    /* 1) Claim */
+    /* 1) Collect creator rewards */
     const preSolDev = await getSolBalance(conn, DEV.publicKey);
     const claimRes = await fetch(`https://pumpportal.fun/api/trade?api-key=${API_KEY}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "collectCreatorFee", priorityFee: 0.000001, pool: "pump", mint: COIN_MINT }),
     });
+
     let claimJson: any = {};
     try { claimJson = await claimRes.json(); } catch {}
-    const claimSig: string | null = claimJson?.signature || claimJson?.txSignature || null;
-    if (claimSig) { try { await conn.confirmTransaction(claimSig, "finalized"); } catch {} }
+    let claimSig: string | null = claimJson?.signature || claimJson?.txSignature || null;
+
+    // ⛳ verify the tx really is collect_creator_fee
+    if (claimSig) {
+      const ok = await isCollectCreatorFee(conn, claimSig);
+      if (!ok) claimSig = null; // do not store wrong tx
+    }
 
     const { deltaSol } = await pollSolDelta(conn, DEV.publicKey, preSolDev);
 
@@ -194,7 +213,7 @@ export async function POST(req: Request) {
         pumpToTreasury: 0,
         pumpToTeam: 0,
         claimedSol: deltaSol,
-        claimSig: claimSig || undefined,
+        claimSig: claimSig || undefined, // may be undefined if not a collect tx
         status: "ok",
         ts: new Date().toISOString(),
         creatorSolDelta: 0,
@@ -276,13 +295,13 @@ export async function POST(req: Request) {
       }
     }
 
-    // persist prep for THIS cycle (snapshot will read this)
+    // persist prep for THIS cycle
     await db.upsertPrep({
       cycleId: thisCycle,
-      acquiredPump: pumpBoughtUi,
+      acquiredPump: pumpBoughtUi,                // UI units
       pumpToTreasury: pumpBoughtUi,
       pumpToTeam: 0,
-      claimSig: claimSig || undefined,
+      claimSig: claimSig || undefined,          // only if it’s really collect_creator_fee
       teamSig: teamSig || undefined,
       treasuryMoveSig: treasuryMoveSig || undefined,
       swapSigTreas: swapSigTreas || undefined,
@@ -290,7 +309,7 @@ export async function POST(req: Request) {
       splitSigs: [teamSig!, treasuryMoveSig!].filter(Boolean),
       status: "ok",
       ts: new Date().toISOString(),
-      creatorSolDelta: deltaSol,
+      creatorSolDelta: deltaSol,                 // SOL delta in DEV
       toTeamSolLamports: teamLamports,
       toTreasurySolLamports: adjustedTreasuryLamports,
       toSwapUi,
@@ -320,6 +339,5 @@ export async function POST(req: Request) {
 }
 
 export async function GET(req: Request) {
-  // Keep GET as a convenience; still protected by x-drop-secret if set
   return POST(req);
 }
