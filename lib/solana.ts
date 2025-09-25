@@ -174,8 +174,8 @@ export async function finalizeAndSendClaimTx(opts: {
   // Deserialize wallet-signed tx
   const tx = VersionedTransaction.deserialize(Buffer.from(walletSignedB64, "base64"));
 
-  // Add treasury signature AFTER the wallet (Phantom-safe order)
-  // NOTE: VersionedTransaction uses .sign([...]) to append signatures.
+  // === Phantom-safe sign order ===
+  // Wallet has already signed; now server adds treasury signature using v0 API:
   tx.sign([treasuryKp]);
 
   // Send & confirm
