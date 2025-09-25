@@ -604,6 +604,12 @@ useEffect(() => {
           </button>
         </div>
       </header>
+{/* Wallets strip under X / How it works (same width: w-56) */}
+<div className="relative z-10 max-w-6xl mx-auto px-5 -mt-2 mb-2">
+  <div className="ml-auto">
+    <WalletStrip />
+  </div>
+</div>
 
       {/* Main */}
       <main className="relative z-10 max-w-6xl mx-auto px-5">
@@ -1183,6 +1189,51 @@ function SolscanBtn({ value }: { value: string }) {
     </a>
   );
 }
+
+/* === Wallet strip (copy with green success) === */
+function WalletCopyRow({ label, addr }: { label: string; addr: string }) {
+  const [copied, setCopied] = useState(false);
+  async function onCopy() {
+    try {
+      await navigator.clipboard.writeText(addr);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {}
+  }
+  return (
+    <div className="flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 bg-[#101017] border border-[#24242f]">
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-[#17171d] border border-[#2a2a33] tracking-wide">
+          {label}
+        </span>
+        <span className="font-mono text-xs truncate">
+          {short(addr, 6, 6)}
+        </span>
+      </div>
+      <button
+        onClick={onCopy}
+        className={`text-[11px] px-2 py-1 rounded-md border transition-all
+          ${copied
+            ? "bg-[var(--accent)] text-black border-transparent shadow"
+            : "bg-[#0c0c12] border-[#2a2a33] hover:bg-[#14141b] active:scale-95"}`}
+        title="Copy address"
+      >
+        {copied ? "Copied!" : "Copy"}
+      </button>
+    </div>
+  );
+}
+
+function WalletStrip() {
+  return (
+    <div className="w-56 space-y-1">
+      <WalletCopyRow label="DEV"      addr="2FgpebF7Ms8gHPx4RrqgXxDkLMGn7jPn8uv4Q7AbgaMB" />
+      <WalletCopyRow label="TREASURY" addr="Hqk72pLgP6h2b2dkLi4YuPXnWddc6hux9p3M82YpfbJG" />
+      <WalletCopyRow label="TEAM"     addr="6vYrrqc4Rsj7QhaTY1HN3YRpRmwP5TEq9zss5HKyd5fh" />
+    </div>
+  );
+}
+
 
 /* === App wrapper === */
 export default function Page() {
