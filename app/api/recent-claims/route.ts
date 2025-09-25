@@ -1,4 +1,8 @@
+// app/api/recent-claims/route.ts
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+export const fetchCache = "force-no-store";
 
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
@@ -11,12 +15,19 @@ type RecentClaim = {
   sig: string;  // transaction signature
 };
 
-export async function GET() {
+export async function GET(req: Request) {
   try {
-    // Ask DB for up to 50 (your db method can already sort; if not, we sort below)
-    const rows = await db.recentClaims(50);
+    const { searchParams } = new URL(req.url);
+    const walletFilter = (searchParams.get("wallet") || "").trim().toLowerCase();
 
-    // Normalize + enforce shape + newest first (in case DB doesn’t enforce it)
+    let rows;
+    if (walletFilter) {
+      rows = await db.recentClaimsByWallet(walletFilter, 50);
+    } else {
+      rows = await db.recentClaims(50);
+    }
+
+    // Normalize + enforce shape + newest first (defensive)
     const data: RecentClaim[] = (Array.isArray(rows) ? rows : [])
       .map((r: any) => ({
         wallet: String(r.wallet || r.owner || ""),
@@ -24,7 +35,7 @@ export async function GET() {
         ts: r.ts ? new Date(r.ts).toISOString() : new Date().toISOString(),
         sig: String(r.sig || r.signature || ""),
       }))
-      .filter((r) => r.wallet && r.sig) // basic sanity
+      .filter((r) => r.wallet && r.sig)
       .sort((a, b) => +new Date(b.ts) - +new Date(a.ts))
       .slice(0, 50);
 
