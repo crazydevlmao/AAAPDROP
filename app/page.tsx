@@ -313,35 +313,6 @@ function InnerApp() {
   /* How it works modal */
   const [showHow, setShowHow] = useState(false);
 
-  /* Cycle notifications + client backup triggers */
-  const didPrepareRef = useRef(false), didPreSnapshotRef = useRef(false);
-  useEffect(() => {
-    const secLeft = Math.floor(msLeft / 1000);
-    if (!didPrepareRef.current && secLeft <= Number(PREP_OFFSET_SECONDS) && secLeft > Number(PREP_OFFSET_SECONDS) - 2) {
-      didPrepareRef.current = true;
-      fetch("/api/prepare-drop", { method: "POST" }).catch(() => {});
-    }
-    if (!didPreSnapshotRef.current && secLeft <= Number(SNAPSHOT_OFFSET_SECONDS) && secLeft > Number(SNAPSHOT_OFFSET_SECONDS) - 2) {
-      didPreSnapshotRef.current = true;
-      (async () => {
-        const url = new URL("/api/snapshot", window.location.origin);
-        url.searchParams.set("mint", COIN_MINT);
-        url.searchParams.set("min", "10000");
-        url.searchParams.set("blacklist", Array.from(blacklistSet).join(","));
-        const data = await fetch(url.toString(), { cache: "no-store" }).then((r) => r.json());
-        setHolders(data.holders || []); setEligible(data.eligible || []);
-        setPumpBalance(data.pumpBalance || 0); setPerHolder(data.perHolder || 0);
-        setSnapshotTs(data.snapshotTs || new Date().toISOString()); setSnapshotId(data.snapshotId || null);
-        refreshMetrics(); refreshRecent(); refreshProofs();
-        showToast("New drop is ready — claim your $PUMP!", "success");
-      })();
-    }
-    if (secLeft <= 0) {
-      didPrepareRef.current = false;
-      didPreSnapshotRef.current = false;
-    }
-  }, [msLeft]);
-
   /* 🔁 Poll holders list every 10s from server cache */
   useEffect(() => {
     let stop = false;
@@ -1360,4 +1331,5 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
