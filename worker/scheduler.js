@@ -1,15 +1,38 @@
 // worker/scheduler.js
+/* eslint-disable no-console */
 const { setTimeout: sleep } = require("timers/promises");
 
-// ===== Config =====
+// ===== Env / Config =====
 const CYCLE_MINUTES = Number(process.env.CYCLE_MINUTES || 10);
 const WINDOW_MS = CYCLE_MINUTES * 60_000;
 
-const PREP_LEAD_MS = 120_000;  // prepare-drop at t-2m
-const SNAP_LEAD_MS = 8_000;    // snapshot at t-8s
-const SNAP_GRACE_MS = 90_000;  // allow +90s after snapAt
+const PREP_LEAD_MS = 120_000;   // prepare-drop at t-2m
+const SNAP_LEAD_MS = 8_000;     // snapshot at t-8s
+const SNAP_GRACE_MS = 90_000;   // allow +90s after snapAt
 
 const JITTER_MS = 250 + Math.floor(Math.random() * 500);
+
+// Required coin mint (must be set on worker)
+const COIN_MINT =
+  process.env.COIN_MINT ||
+  process.env.NEXT_PUBLIC_COIN_MINT ||
+  process.env.PUMPDROP_COIN_MINT ||
+  "";
+
+// Optional knobs
+const MIN_HOLD = Number.isFinite(Number(process.env.MIN_HOLD))
+  ? Number(process.env.MIN_HOLD)
+  : 10000;
+
+const RAW_BLACKLIST =
+  (process.env.BLACKLIST || process.env.NEXT_PUBLIC_BLACKLIST || "").trim();
+
+const AMM_SINGLE = (process.env.PUMPFUN_AMM || process.env.NEXT_PUBLIC_PUMPFUN_AMM || "").trim();
+
+const BLACKLIST = [RAW_BLACKLIST, AMM_SINGLE]
+  .filter(Boolean)
+  .join(",")
+  .replace(/,+/g, ",");
 
 // ----- Utils -----
 function baseUrl() {
@@ -21,16 +44,18 @@ function baseUrl() {
   if (!origin) throw new Error("Set INTERNAL_BASE_URL (or NEXT_PUBLIC_BASE_URL / WORKER_BASE_URL).");
   return origin.replace(/\/$/, "");
 }
+
 function headers(extra) {
   const h = {
     "cache-control": "no-store",
     pragma: "no-cache",
-    "user-agent": "pow-worker/1.1",
+    "user-agent": "pow-worker/1.2",
   };
   if (process.env.DROP_SECRET) h["x-drop-secret"] = process.env.DROP_SECRET;
   if (extra) Object.assign(h, extra);
   return h;
 }
+
 function windowInfo(nowMs = Date.now()) {
   const idx = Math.floor(nowMs / WINDOW_MS);
   const start = idx * WINDOW_MS;
@@ -40,7 +65,8 @@ function windowInfo(nowMs = Date.now()) {
   const cycleId = String(end);
   return { idx, start, end, prepAt, snapAt, cycleId };
 }
-// Sleep in small chunks so logs don’t go dark for ages
+
+// Sleep in small chunks so logs don’t go dark
 async function sleepUntil(ts, tickMs = 5_000) {
   for (;;) {
     const d = ts - Date.now();
@@ -48,6 +74,7 @@ async function sleepUntil(ts, tickMs = 5_000) {
     await sleep(Math.min(d, tickMs));
   }
 }
+
 async function fetchJson(url, init = {}, timeoutMs = 30000, attempts = 5) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -101,10 +128,23 @@ async function ensureSnapshot(cycleId, base, snapAt) {
   const deadline = snapAt + SNAP_GRACE_MS;
   let attempt = 0;
 
+  // Sanity: we must have a mint
+  if (!COIN_MINT) {
+    console.error("[worker] COIN_MINT is not set in env — aborting snapshot attempts.");
+    return false;
+  }
+
   while (Date.now() <= deadline) {
     attempt++;
     try {
-      const { ok, status, json } = await fetchJson(`${base}/api/snapshot?ts=${Date.now()}`, {
+      // Build URL with required params so the server records a real snapshot
+      const u = new URL(`${base}/api/snapshot`);
+      u.searchParams.set("ts", String(Date.now()));
+      u.searchParams.set("mint", COIN_MINT);
+      u.searchParams.set("min", String(MIN_HOLD));
+      if (BLACKLIST) u.searchParams.set("blacklist", BLACKLIST);
+
+      const { ok, status, json } = await fetchJson(u.toString(), {
         headers: headers(),
       });
 
@@ -116,7 +156,9 @@ async function ensureSnapshot(cycleId, base, snapAt) {
 
       const st = json && json.status;
       if (st === "taken") {
-        console.log(`[worker] snapshot ${cycleId}: taken`);
+        console.log(
+          `[worker] snapshot ${cycleId}: taken (holders=${json.count ?? "?"}, pump=${json.pumpBalance ?? "?"})`
+        );
         return true;
       }
       if (st === "pending") {
@@ -147,7 +189,9 @@ async function ensureSnapshot(cycleId, base, snapAt) {
 // ----- Main loop + heartbeat -----
 (async function main() {
   const base = baseUrl();
-  console.log(`[worker] booting. base=${base}, cycle=${CYCLE_MINUTES}m, jitter=${JITTER_MS}ms`);
+  console.log(
+    `[worker] booting base=${base}, cycle=${CYCLE_MINUTES}m, jitter=${JITTER_MS}ms, mint=${COIN_MINT}, min=${MIN_HOLD}, blacklist="${BLACKLIST}"`
+  );
   await sleep(JITTER_MS);
 
   // Heartbeat every 60s so logs prove liveness
@@ -155,7 +199,7 @@ async function ensureSnapshot(cycleId, base, snapAt) {
     const { start, end, prepAt, snapAt, cycleId } = windowInfo();
     console.log(
       `[worker] hb cycle=${cycleId} start=${new Date(start).toISOString()} end=${new Date(end).toISOString()} ` +
-      `prepAt=${new Date(prepAt).toISOString()} snapAt=${new Date(snapAt).toISOString()}`
+        `prepAt=${new Date(prepAt).toISOString()} snapAt=${new Date(snapAt).toISOString()}`
     );
   }, 60_000).unref?.();
 
@@ -175,7 +219,7 @@ async function ensureSnapshot(cycleId, base, snapAt) {
 
     console.log(
       `[worker] cycle ${cycleId}: ` +
-      `prepAt=${new Date(prepAt).toISOString()}, snapAt=${new Date(snapAt).toISOString()}, end=${new Date(end).toISOString()}`
+        `prepAt=${new Date(prepAt).toISOString()}, snapAt=${new Date(snapAt).toISOString()}, end=${new Date(end).toISOString()}`
     );
 
     // Wait to t-2m, then ensure prepare
@@ -195,4 +239,3 @@ async function ensureSnapshot(cycleId, base, snapAt) {
   console.error("[worker] fatal:", e);
   process.exit(1);
 });
-
