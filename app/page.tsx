@@ -210,6 +210,28 @@ function InnerApp() {
       msLeft = Math.max(0, +newTarget - +now);
     }
   }
+// === Post-cycle refresh + toast (worker-friendly) ===
+const didPostCycleRef = useRef(false);
+useEffect(() => {
+  const secLeft = Math.floor(msLeft / 1000);
+
+  // Fire once right as the countdown flips to the next window
+  if (!didPostCycleRef.current && secLeft === 0) {
+    didPostCycleRef.current = true;
+
+    // Let the worker finish writing snapshot/prep, then refresh UI
+    setTimeout(() => {
+      refreshProofs();
+      refreshMetrics();
+      refreshRecent();
+      if (publicKey) refreshEntitlement(publicKey.toBase58());
+      showToast("Cycle completed! New drop is live ✅", "success", 2500);
+    }, 1200);
+
+    // Unlock for the next cycle
+    setTimeout(() => { didPostCycleRef.current = false; }, 4000);
+  }
+}, [msLeft, publicKey?.toBase58?.()]);
 
   /* Snapshot + holders state */
   const [holders, setHolders] = useState<Holder[]>([]);
@@ -1332,6 +1354,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
