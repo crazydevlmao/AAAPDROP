@@ -98,8 +98,9 @@ async function getRecentBlockhashCached(conn: Connection): Promise<string> {
       setTimeout(() => { BH_PENDING = null; }, 50);
     });
   }
-  return BH_PENDING;
+  return BH_PENDING!; // <- important: non-null assertion
 }
+
 
 /**
  * Build an UNSIGNED claim tx where the USER is the FEE PAYER.
@@ -183,3 +184,4 @@ export async function buildClaimTx(opts: {
     feeSol: CLAIM_FEE_SOL,
   };
 }
+
