@@ -48,7 +48,7 @@ async function sleepUntil(ts, tickMs = 5_000) {
     await sleep(Math.min(d, tickMs));
   }
 }
-async function fetchJson(url, init = {}, timeoutMs = 12_000, attempts = 3) {
+async function fetchJson(url, init = {}, timeoutMs = 30000, attempts = 5) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     const ctrl = new AbortController();
@@ -195,3 +195,4 @@ async function ensureSnapshot(cycleId, base, snapAt) {
   console.error("[worker] fatal:", e);
   process.exit(1);
 });
+
