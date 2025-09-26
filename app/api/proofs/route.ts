@@ -238,10 +238,10 @@ async function computeProofs(): Promise<ProofsPayload> {
 
   // Validate the stored claimSig -> must be a collectCreatorFee tx
   let claimSig: string | null = prep?.claimSig ?? null;
-  if (claimSig) {
-    const ok = await isCollectCreatorFee(claimSig);
-    if (!ok) claimSig = null;
-  }
+let claimVerified = false;
+if (claimSig) {
+  try { claimVerified = await isCollectCreatorFee(claimSig); } catch {}
+}
 
   const swapSig: string | null =
     prep?.swapSigTreas ??
@@ -331,3 +331,4 @@ export async function GET(req: Request) {
     );
   }
 }
+
