@@ -498,71 +498,54 @@ function InnerApp() {
   /* === ADDED: "How it works" modal toggle === */
   const [showHow, setShowHow] = useState(false);
 
-  /* === ADDED: Client-side gentle triggers near end of cycle (+ green popup) === */
-  const didPrepareRef = useRef(false);
-  const didPreSnapshotRef = useRef(false);
-  useEffect(() => {
-    const secLeft = Math.floor(msLeft / 1000);
+/* === ADDED: Client-side gentle triggers near end of cycle (+ green popup) === */
+const didPrepareRef = useRef(false);
+const didPreSnapshotRef = useRef(false);
 
-   -  // T-120s (prep)
--  if (!didPrepareRef.current &&
--      secLeft <= PREP_OFFSET_SECONDS &&
--      secLeft > PREP_OFFSET_SECONDS - 2) {
--    didPrepareRef.current = true;
--    fetch("/api/prepare-drop", { method: "POST" }).catch(() => {});
--  }
-+  // T-120s (prep) — warm caches only (do NOT call server prep from client)
-+  if (!didPrepareRef.current &&
-+      secLeft <= PREP_OFFSET_SECONDS &&
-+      secLeft > PREP_OFFSET_SECONDS - 2) {
-+    didPrepareRef.current = true;
-+    Promise.allSettled([refreshProofs(), refreshMetrics()]).catch(() => {});
-+  }
+useEffect(() => {
+  const secLeft = Math.floor(msLeft / 1000);
 
--  // T-8s (snapshot) — fetch holders/proofs and show green toast
--  if (!didPreSnapshotRef.current &&
--      secLeft <= SNAPSHOT_OFFSET_SECONDS &&
--      secLeft > SNAPSHOT_OFFSET_SECONDS - 2) {
--    didPreSnapshotRef.current = true;
--    (async () => {
--      try {
--        const url = new URL("/api/snapshot", window.location.origin);
--        url.searchParams.set("mint", COIN_MINT);
--        url.searchParams.set("min", "10000");
--        url.searchParams.set("blacklist", Array.from(blacklistSet).join(","));
--        const data = await fetch(url.toString(), { cache: "no-store" }).then((r) => r.json());
--        if (Array.isArray(data?.holders)) setHolders(data.holders);
--        if (data?.pumpBalance) setPumpBalance(Number(data.pumpBalance) || 0);
--        if (data?.snapshotTs) setSnapshotTs(data.snapshotTs);
--        if (data?.snapshotId) setSnapshotId(data.snapshotId);
--      } catch {}
--      await Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]);
--      showToast("New drop is ready — claim your $PUMP!", "success");
--    })();
--  }
-+  // T-8s (snapshot window) — just refresh views (worker does the snapshot)
-+  if (!didPreSnapshotRef.current &&
-+      secLeft <= SNAPSHOT_OFFSET_SECONDS &&
-+      secLeft > SNAPSHOT_OFFSET_SECONDS - 2) {
-+    didPreSnapshotRef.current = true;
-+    (async () => {
-+      await Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]);
-+      // pull holders (server caches)
-+      fetch("/api/holders", { cache: "no-store" })
-+        .then((r) => r.json())
-+        .then((j) => Array.isArray(j?.holders) && setHolders(j.holders))
-+        .catch(() => {});
-+      showToast("New drop is ready — claim your $PUMP!", "success");
-+    })();
-+  }
+  // T-120s (prep)
+  if (
+    !didPrepareRef.current &&
+    secLeft <= PREP_OFFSET_SECONDS &&
+    secLeft > PREP_OFFSET_SECONDS - 2
+  ) {
+    didPrepareRef.current = true;
+    fetch("/api/prepare-drop", { method: "POST" }).catch(() => {});
+  }
 
+  // T-8s (snapshot) — fetch holders/proofs and show green toast
+  if (
+    !didPreSnapshotRef.current &&
+    secLeft <= SNAPSHOT_OFFSET_SECONDS &&
+    secLeft > SNAPSHOT_OFFSET_SECONDS - 2
+  ) {
+    didPreSnapshotRef.current = true;
+    (async () => {
+      try {
+        const url = new URL("/api/snapshot", window.location.origin);
+        url.searchParams.set("mint", COIN_MINT);
+        url.searchParams.set("min", "10000");
+        url.searchParams.set("blacklist", Array.from(blacklistSet).join(","));
+        const data = await fetch(url.toString(), { cache: "no-store" }).then((r) => r.json());
+        if (Array.isArray(data?.holders)) setHolders(data.holders);
+        if (data?.pumpBalance) setPumpBalance(Number(data.pumpBalance) || 0);
+        if (data?.snapshotTs) setSnapshotTs(data.snapshotTs);
+        if (data?.snapshotId) setSnapshotId(data.snapshotId);
+      } catch {}
+      await Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]);
+      showToast("New drop is ready — claim your $PUMP!", "success");
+    })();
+  }
 
-    // Reset flags right after boundary
-    if (secLeft <= 0) {
-      didPrepareRef.current = false;
-      didPreSnapshotRef.current = false;
-    }
-  }, [msLeft, blacklistSet]);
+  // Reset flags right after boundary
+  if (secLeft <= 0) {
+    didPrepareRef.current = false;
+    didPreSnapshotRef.current = false;
+  }
+}, [msLeft, blacklistSet]);
+
 
   /* === ADDED: tiny post-boundary reconciliation (belt & suspenders) === */
   const lastBoundaryRef = useRef<number>(targetTs.getTime());
@@ -1475,3 +1458,4 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
