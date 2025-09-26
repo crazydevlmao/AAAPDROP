@@ -3,7 +3,7 @@ import "./globals.css";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "PUMPDROP",
+  title: "PUMPDROP APP",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -13,3 +13,4 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
+
