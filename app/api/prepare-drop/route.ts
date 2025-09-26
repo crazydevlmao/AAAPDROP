@@ -16,14 +16,20 @@ import {
 import bs58 from "bs58";
 import { db } from "@/lib/db";
 
-/* =================== Tunables =================== */
-const TEAM_PCT = 0.10;
-const TREASURY_SOL_PCT = 0.85;
-const SWAP_IN_TREASURY_PCT = 0.95;
-const SLIPPAGES_BPS = [100, 200, 300];
+/* =================== Tunables (trimmed to avoid timeouts) =================== */
+const TEAM_PCT = 0.10;              // 10% to TEAM
+const TREASURY_SOL_PCT = 0.85;      // 85% to TREASURY (rest stays on DEV as buffer)
+const SWAP_IN_TREASURY_PCT = 0.95;  // swap 95% of received SOL in Treasury
 
-const POLL_TRIES = 18;
-const POLL_DELAY_MS = 900;
+// Keep API under ~10–12s so the worker doesn’t AbortError
+const POLL_TRIES_DELTA = 8;         // was 18
+const POLL_DELAY_MS = 700;          // was 900
+
+// Faster check for Treasury balance increase (don’t block long)
+const TREAS_POLL_TRIES = 6;         // was 18
+const TREAS_POLL_DELAY = 600;       // was 900
+
+const SLIPPAGES_BPS = [100, 200, 300];
 
 const MIN_DEV_BUFFER_SOL =
   typeof process.env.MIN_DEV_BUFFER_SOL === "string"
@@ -52,6 +58,7 @@ async function getSolBalance(conn: Connection, pubkey: PublicKey, comm: "confirm
   return (await conn.getBalance(pubkey, comm)) / LAMPORTS_PER_SOL;
 }
 async function sendSol(conn: Connection, from: Keypair, to: PublicKey, lamports: number) {
+  if (lamports <= 0) return null;
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash("finalized");
   const ix = SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports });
   const msg = new TransactionMessage({ payerKey: from.publicKey, recentBlockhash: blockhash, instructions: [ix] }).compileToV0Message();
@@ -62,7 +69,7 @@ async function sendSol(conn: Connection, from: Keypair, to: PublicKey, lamports:
   return sig;
 }
 async function pollSolDelta(conn: Connection, owner: PublicKey, preSol: number) {
-  for (let i = 0; i < POLL_TRIES; i++) {
+  for (let i = 0; i < POLL_TRIES_DELTA; i++) {
     const b = await getSolBalance(conn, owner);
     const d = Math.max(0, b - preSol);
     if (d > 0) return { postSol: b, deltaSol: d };
@@ -73,10 +80,10 @@ async function pollSolDelta(conn: Connection, owner: PublicKey, preSol: number) 
 }
 async function waitTreasuryIncrease(conn: Connection, treasury: PublicKey, preTreasSol: number, expectedDeltaSol: number) {
   const tol = Math.max(0.0001, expectedDeltaSol * 0.01);
-  for (let i = 0; i < POLL_TRIES; i++) {
+  for (let i = 0; i < TREAS_POLL_TRIES; i++) {
     const cur = await getSolBalance(conn, treasury);
     if (cur >= preTreasSol + expectedDeltaSol - tol) return cur;
-    await sleep(POLL_DELAY_MS);
+    await sleep(TREAS_POLL_DELAY);
   }
   return await getSolBalance(conn, treasury);
 }
@@ -84,7 +91,6 @@ async function waitTreasuryIncrease(conn: Connection, treasury: PublicKey, preTr
 /** Only accept a tx as "creator rewards" if logs contain `collect_creator_fee`. */
 async function isCollectCreatorFee(conn: Connection, sig: string): Promise<boolean> {
   try {
-    // string overload is fine here
     await conn.confirmTransaction(sig, "finalized");
     const tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "finalized" });
     const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
@@ -97,7 +103,8 @@ async function isCollectCreatorFee(conn: Connection, sig: string): Promise<boole
 async function jupQuote(solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const outputMint = PUMP_MINT;
-  const amountLamports = Math.floor(solUiAmount * LAMPORTS_PER_SOL);
+  const amountLamports = Math.floor(solUiAmount * LAMPORTS_PER_SOL); // integer
+  if (amountLamports <= 0) throw new Error("Jupiter: zero amount");
   const url =
     `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}` +
     `&outputMint=${outputMint}` +
@@ -138,7 +145,7 @@ async function jupSwap(conn: Connection, signer: Keypair, quoteResp: any) {
 }
 function requireSecret(req: Request) {
   const s = process.env.DROP_SECRET;
-  if (!s) return;
+  if (!s) return; // optional
   const got = req.headers.get("x-drop-secret");
   if (got !== s) throw new Error("Unauthorized (invalid x-drop-secret)");
 }
@@ -169,16 +176,27 @@ export async function POST(req: Request) {
     const TREASURY_SECRET = process.env.TREASURY_SECRET?.trim();
     const TREASURY_KP = TREASURY_SECRET ? kpFromBase58(TREASURY_SECRET) : null;
     if (!TREASURY_KP) {
-      return NextResponse.json({ ok: false, error: "Missing TREASURY_SECRET; required to swap in Treasury." }, { status: 400, headers: noStore });
+      return NextResponse.json(
+        { ok: false, error: "Missing TREASURY_SECRET; required to swap in Treasury." },
+        { status: 400, headers: noStore }
+      );
     }
 
     const conn = new Connection(pickRpc(), "confirmed");
     const thisCycle = cycleIdNow();
 
-    // ===== Idempotency guard =====
+    // ===== Idempotency guard (allow retry if swap didn't happen yet) =====
     const existing = await db.getPrep(thisCycle);
-    if (existing && existing.status === "ok") {
-      if (existing.acquiredPump > 0 || existing.swapSigTreas || existing.teamSig || existing.treasuryMoveSig) {
+    if (existing) {
+      if (Number(existing.acquiredPump) > 0) {
+        return NextResponse.json(
+          { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
+          { headers: noStore }
+        );
+      }
+      // If we already moved SOL to Treasury and tried swap (or delta was zero), also stop
+      if (existing.swapSigTreas || existing.status === "swap_failed_or_dust" || existing.status === "ok") {
+        // We consider this cycle handled; snapshot will use existing.prep fields.
         return NextResponse.json(
           { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
           { headers: noStore }
@@ -198,10 +216,10 @@ export async function POST(req: Request) {
     try { claimJson = await claimRes.json(); } catch {}
     let claimSig: string | null = claimJson?.signature || claimJson?.txSignature || null;
 
-    // ⛳ verify the tx really is collect_creator_fee
+    // verify it’s really collect_creator_fee
     if (claimSig) {
       const ok = await isCollectCreatorFee(conn, claimSig);
-      if (!ok) claimSig = null; // do not store wrong tx
+      if (!ok) claimSig = null;
     }
 
     const { deltaSol } = await pollSolDelta(conn, DEV.publicKey, preSolDev);
@@ -212,8 +230,8 @@ export async function POST(req: Request) {
         acquiredPump: 0,
         pumpToTreasury: 0,
         pumpToTeam: 0,
-        claimedSol: deltaSol,
-        claimSig: claimSig || undefined, // may be undefined if not a collect tx
+        claimedSol: 0,
+        claimSig: claimSig || undefined,
         status: "ok",
         ts: new Date().toISOString(),
         creatorSolDelta: 0,
@@ -221,11 +239,13 @@ export async function POST(req: Request) {
         toTreasurySolLamports: 0,
         toSwapUi: 0,
         swapOutPumpUi: 0,
+        swapSigs: [],
+        splitSigs: [],
       });
-      return NextResponse.json({ ok: true, step: "claimed-zero", claimSig, deltaSol }, { headers: noStore });
+      return NextResponse.json({ ok: true, step: "claimed-zero", claimSig, deltaSol: 0 }, { headers: noStore });
     }
 
-    /* 2) Split SOL */
+    /* 2) Split SOL (don’t spend too long waiting) */
     const freshLamports = Math.floor(deltaSol * LAMPORTS_PER_SOL);
     const teamLamports = Math.floor(freshLamports * TEAM_PCT);
     const treasuryLamports = Math.floor(freshLamports * TREASURY_SOL_PCT);
@@ -238,7 +258,7 @@ export async function POST(req: Request) {
     let teamSig: string | null = null;
     if (teamLamports > 0) {
       teamSig = await sendSol(conn, DEV, TEAM_PUB, teamLamports);
-      await sleep(400);
+      await sleep(200);
     }
 
     let treasuryMoveSig: string | null = null;
@@ -246,12 +266,14 @@ export async function POST(req: Request) {
     if (adjustedTreasuryLamports > 0) {
       treasuryMoveSig = await sendSol(conn, DEV, TREASURY_PUB, adjustedTreasuryLamports);
     }
+
+    // Try a short wait for Treasury balance to reflect; fall back to theoretical amount
     let postTreasSol = preTreasSol;
     if (adjustedTreasuryLamports > 0) {
       postTreasSol = await waitTreasuryIncrease(conn, TREASURY_PUB, preTreasSol, adjustedTreasuryLamports / LAMPORTS_PER_SOL);
     }
 
-    /* 3) Swap in Treasury */
+    /* 3) Swap in Treasury (retry slippages but don’t hang forever) */
     const receivedSol =
       postTreasSol - preTreasSol > 0 ? postTreasSol - preTreasSol : adjustedTreasuryLamports / LAMPORTS_PER_SOL;
     const toSwapUi = Math.max(0, receivedSol * SWAP_IN_TREASURY_PCT);
@@ -263,12 +285,15 @@ export async function POST(req: Request) {
       let lastErr: any = null;
       for (const s of SLIPPAGES_BPS) {
         try {
-          await sleep(800);
           const quote = await jupQuote(toSwapUi, s);
-          swapSigTreas = await jupSwap(conn, TREASURY_KP, quote);
+          // Estimate outAmount from quote (UI units), guarded
           try { pumpBoughtUi = Number(quote?.outAmount ?? 0) / 1e6; } catch {}
+          swapSigTreas = await jupSwap(conn, TREASURY_KP!, quote);
           break;
-        } catch (e) { lastErr = e; await sleep(1200); }
+        } catch (e) {
+          lastErr = e;
+          await sleep(500);
+        }
       }
       if (!swapSigTreas) {
         await db.upsertPrep({
@@ -280,22 +305,24 @@ export async function POST(req: Request) {
           teamSig: teamSig || undefined,
           treasuryMoveSig: treasuryMoveSig || undefined,
           swapSigTreas: undefined,
-          status: "error",
+          status: "swap_failed_or_dust",
           ts: new Date().toISOString(),
           creatorSolDelta: deltaSol,
           toTeamSolLamports: teamLamports,
           toTreasurySolLamports: adjustedTreasuryLamports,
           toSwapUi,
           swapOutPumpUi: 0,
+          splitSigs: [teamSig!, treasuryMoveSig!].filter(Boolean),
+          swapSigs: [],
         });
         return NextResponse.json(
-          { ok: false, step: "treasury-swap-failed", claimSig, teamSig, treasuryMoveSig, reason: String(lastErr) },
-          { status: 500, headers: noStore }
+          { ok: true, step: "treasury-swap-failed", reason: String(lastErr) },
+          { headers: noStore }
         );
       }
     }
 
-    // persist prep for THIS cycle
+    // Persist prep for THIS cycle
     await db.upsertPrep({
       cycleId: thisCycle,
       acquiredPump: pumpBoughtUi,                // UI units
@@ -328,7 +355,7 @@ export async function POST(req: Request) {
           keptOnDevLamports: freshLamports - teamLamports - adjustedTreasuryLamports,
         },
         txs: { teamSig, treasuryMoveSig, swapSigTreas },
-        notes: "PUMP now sits in Treasury; entitlements will be allocated at snapshot.",
+        notes: "Prepared. Snapshot will allocate this cycle’s PUMP to eligible holders.",
       },
       { headers: noStore }
     );
