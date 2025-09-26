@@ -42,14 +42,19 @@ type ProofsPayload = {
   deltaPump: number;
   creatorSol: number;
   pumpSwapped: number;
-  txs: { claimSig: string | null; claimSolscan?: string; swapSig: string | null; swapSolscan?: string };
+  txs: {
+    claimSig: string | null;
+    claimSolscan?: string;
+    swapSig: string | null;
+    swapSolscan?: string;
+  };
   previous: any[];
 };
 let SNAP_CACHE: { at: number; key: string; data: ProofsPayload } | null = null;
 let PENDING: Promise<ProofsPayload> | null = null;
 
 // Per-tx derived values cache (avoid re-decoding same tx)
-type TxCacheEntry = { at: number; creatorSol?: number; pumpSwapped?: number };
+type TxCacheEntry = { at: number; creatorSol?: number; pumpSwapped?: number; isCollect?: boolean };
 const TX_CACHE = new Map<string, TxCacheEntry>();
 
 function cidOf(req: Request) {
@@ -75,16 +80,41 @@ function allAccountKeys(msg: any): PublicKey[] {
       if (out.length) return out;
     }
   } catch {}
-  // Fallback (old web3.js may expose combined list)
+  // Fallback (older web3.js)
   const fallback = (msg?.accountKeys || []) as PublicKey[];
   return Array.isArray(fallback) ? fallback : [];
+}
+
+/** Quick check: does this tx have the Pump log line? */
+async function isCollectCreatorFee(sig: string): Promise<boolean> {
+  const key = "isCollect:" + sig;
+  const hit = TX_CACHE.get(key);
+  const now = Date.now();
+  if (hit && now - hit.at < TX_TTL_MS && typeof hit.isCollect === "boolean") {
+    return !!hit.isCollect;
+  }
+  try {
+    const conn = connection();
+    await conn.confirmTransaction(sig, "finalized");
+    const tx = await conn.getTransaction(sig, {
+      maxSupportedTransactionVersion: 0,
+      commitment: "finalized",
+    });
+    const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
+    const ok = logs.some((l) => l.toLowerCase().includes("collect_creator_fee"));
+    TX_CACHE.set(key, { at: now, isCollect: ok });
+    return ok;
+  } catch {
+    TX_CACHE.set(key, { at: now, isCollect: false });
+    return false;
+  }
 }
 
 async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<number> {
   const key = "creator:" + sig;
   const hit = TX_CACHE.get(key);
   const now = Date.now();
-  if (hit && now - hit.at < TX_TTL_MS && typeof hit.creatorSol === "number") return hit.creatorSol!;
+  if (hit && now - hit.at < TX_TTL_MS && typeof hit.creatorSol === "number") return Math.max(0, hit.creatorSol!);
 
   const conn = connection();
   const tx = await conn.getTransaction(sig, {
@@ -102,7 +132,7 @@ async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<numb
   const pre = tx.meta.preBalances?.[i] ?? 0;
   const post = tx.meta.postBalances?.[i] ?? 0;
   const deltaLamports = post - pre;
-  const val = deltaLamports / 1e9;
+  const val = Math.max(0, deltaLamports / 1e9); // never negative
 
   TX_CACHE.set(key, { at: now, creatorSol: val });
   return val;
@@ -206,7 +236,13 @@ async function computeProofs(): Promise<ProofsPayload> {
   // prep row for this cycle
   const prep: any = (db as any)?.getPrep ? await (db as any).getPrep(snap?.cycleId || "") : null;
 
-  const claimSig: string | null = prep?.claimSig ?? null;
+  // Validate the stored claimSig -> must be a collectCreatorFee tx
+  let claimSig: string | null = prep?.claimSig ?? null;
+  if (claimSig) {
+    const ok = await isCollectCreatorFee(claimSig);
+    if (!ok) claimSig = null;
+  }
+
   const swapSig: string | null =
     prep?.swapSigTreas ??
     ((Array.isArray(prep?.swapSigs) && prep.swapSigs.length > 0) ? prep.swapSigs[0] : null) ??
