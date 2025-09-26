@@ -2,15 +2,13 @@
 import { promises as fs } from "fs";
 import path from "path";
 
-// lib/db.ts
-const dataDir = process.env.DATA_DIR || path.join(process.cwd(), "data");
-
+const dataDir = path.join(process.cwd(), "data");
 const files = {
   preps: path.join(dataDir, "preps.json"),
   snapshots: path.join(dataDir, "snapshots.json"),
   entitlements: path.join(dataDir, "entitlements.json"),
   claims: path.join(dataDir, "claims.json"),
-  metrics: path.join(dataDir, "metrics.json"), // NEW
+  metrics: path.join(dataDir, "metrics.json"),
 };
 
 // ===== Types =====
@@ -41,7 +39,7 @@ export type Prep = {
 
 export type Snapshot = {
   cycleId: string;       // UNIQUE (per-window)
-  snapshotId: string;    // we use = cycleId (deterministic), but kept explicit
+  snapshotId: string;    // we use = cycleId
   snapshotTs: string;
   deltaPump: number;
   eligibleCount: number;
@@ -68,6 +66,17 @@ type Metrics = {
   totalDistributedPump: number; // running sum of *claimed* PUMP (UI units)
 };
 
+// ===== Per-file write queue (prevents concurrent write corruption) =====
+const WRITE_QUEUE = new Map<string, Promise<void>>();
+function enqueueWrite(target: string, task: () => Promise<void>) {
+  const prev = WRITE_QUEUE.get(target) || Promise.resolve();
+  const next = prev.then(task).catch(() => {}).finally(() => {
+    if (WRITE_QUEUE.get(target) === next) WRITE_QUEUE.delete(target);
+  });
+  WRITE_QUEUE.set(target, next);
+  return next;
+}
+
 // ===== Low-level JSON file helpers =====
 async function ensure() {
   await fs.mkdir(dataDir, { recursive: true });
@@ -91,10 +100,12 @@ async function read<T>(f: string): Promise<T[]> {
 
 async function write<T>(f: string, rows: T[]) {
   await ensure();
-  // Write atomically via temp file then rename
   const tmp = `${f}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(rows, null, 2));
-  await fs.rename(tmp, f);
+  const payload = JSON.stringify(rows, null, 2);
+  await enqueueWrite(f, async () => {
+    await fs.writeFile(tmp, payload);
+    await fs.rename(tmp, f);
+  });
 }
 
 async function readObj<T>(f: string, fallback: T): Promise<T> {
@@ -110,35 +121,28 @@ async function readObj<T>(f: string, fallback: T): Promise<T> {
 async function writeObj<T>(f: string, obj: T) {
   await ensure();
   const tmp = `${f}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(obj, null, 2));
-  await fs.rename(tmp, f);
+  const payload = JSON.stringify(obj, null, 2);
+  await enqueueWrite(f, async () => {
+    await fs.writeFile(tmp, payload);
+    await fs.rename(tmp, f);
+  });
 }
 
 // ===== De-dupe helpers =====
 function dedupeSnapshotsKeepEarliest(rows: Snapshot[]): Snapshot[] {
-  // collapse by cycleId; keep earliest snapshotTs
   const byCycle = new Map<string, Snapshot>();
   for (const s of rows) {
     const key = String(s.cycleId);
     const prev = byCycle.get(key);
-    if (!prev) {
-      byCycle.set(key, s);
-    } else {
-      // keep the earliest created snapshot (lower snapshotTs)
-      if (new Date(s.snapshotTs).getTime() < new Date(prev.snapshotTs).getTime()) {
-        byCycle.set(key, s);
-      }
-    }
+    if (!prev) byCycle.set(key, s);
+    else if (new Date(s.snapshotTs).getTime() < new Date(prev.snapshotTs).getTime()) byCycle.set(key, s);
   }
-  // sort by cycleId ascending; cap retention
   const sorted = Array.from(byCycle.values()).sort((a, b) => Number(a.cycleId) - Number(b.cycleId));
-  // keep last N cycles (increase if you want more history)
   const RETAIN = 200;
   return sorted.slice(-RETAIN);
 }
 
 function dedupeEntitlementsMerge(rows: Entitlement[]): Entitlement[] {
-  // collapse by (snapshotId, wallet), merge claimed + claimSig
   const map = new Map<string, Entitlement>();
   for (const r of rows) {
     const wallet = String(r.wallet || "").toLowerCase();
@@ -147,14 +151,32 @@ function dedupeEntitlementsMerge(rows: Entitlement[]): Entitlement[] {
     if (!prev) {
       map.set(key, { ...r, wallet });
     } else {
-      // If either is claimed, claimed wins; prefer a defined claimSig
       const claimed = prev.claimed || r.claimed;
       const claimSig = r.claimSig || prev.claimSig;
-      // For amount, keep the first written (snapshot amount should be deterministic per wallet)
       map.set(key, { ...prev, claimed, claimSig });
     }
   }
   return Array.from(map.values());
+}
+
+// ===== Claims dedupe by signature =====
+function dedupeClaimsBySig(rows: Claim[]): Claim[] {
+  const seen = new Set<string>();
+  const out: Claim[] = [];
+  for (const c of rows) {
+    const sig = String(c.sig || "");
+    if (!sig) continue;
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push({
+      wallet: String(c.wallet || "").toLowerCase(),
+      amount: Number(c.amount || 0),
+      ts: new Date(c.ts || Date.now()).toISOString(),
+      sig,
+    });
+  }
+  // newest first (not required, but keeps file stable)
+  return out.sort((a, b) => +new Date(b.ts) - +new Date(a.ts));
 }
 
 // ===== Public DB API =====
@@ -181,25 +203,26 @@ export const db = {
   },
   async getSnapshot(cycleId: string): Promise<Snapshot | undefined> {
     const rows = await read<Snapshot>(files.snapshots);
-    // ensure uniqueness view
     const deduped = dedupeSnapshotsKeepEarliest(rows);
     return deduped.find(r => r.cycleId === cycleId);
   },
-  async latestSnapshot(): Promise<Snapshot | undefined> {
+  async getLatestSnapshot(): Promise<Snapshot | undefined> {
     const rows = await read<Snapshot>(files.snapshots);
     const deduped = dedupeSnapshotsKeepEarliest(rows);
     return deduped[deduped.length - 1];
   },
-  async listSnapshots(): Promise<Snapshot[]> {
+  async listSnapshots(limit?: number): Promise<Snapshot[]> {
     const rows = await read<Snapshot>(files.snapshots);
-    return dedupeSnapshotsKeepEarliest(rows);
+    const deduped = dedupeSnapshotsKeepEarliest(rows);
+    const desc = deduped.slice().reverse();
+    const prevOnly = desc.slice(1);
+    return typeof limit === "number" && limit > 0 ? prevOnly.slice(0, limit) : prevOnly;
   },
 
   // ---- entitlements ----
   /** Idempotent add: one row per (snapshotId, wallet). */
   async addEntitlements(rowsIn: Entitlement[]) {
     const rows = await read<Entitlement>(files.entitlements);
-    // normalize wallets to lowercase, then merge with existing
     const combined = rows.concat(
       rowsIn.map(r => ({ ...r, wallet: String(r.wallet || "").toLowerCase() }))
     );
@@ -225,17 +248,18 @@ export const db = {
     await write(files.entitlements, deduped);
   },
 
-  // ---- claims feed ----
+  // ---- claims feed (idempotent via sig) ----
   async addClaim(c: Claim) {
     const rows = await read<Claim>(files.claims);
-    rows.push({
-      ...c,
+    const normalized = {
       wallet: String(c.wallet || "").toLowerCase(),
       amount: Number(c.amount || 0),
       ts: new Date(c.ts || Date.now()).toISOString(),
       sig: String(c.sig || ""),
-    });
-    await write(files.claims, rows);
+    };
+    rows.push(normalized);
+    const deduped = dedupeClaimsBySig(rows);
+    await write(files.claims, deduped);
   },
 
   async insertRecentClaim({ wallet, amount, sig, ts }: { wallet: string; amount: number; sig: string; ts: string }) {
@@ -244,36 +268,33 @@ export const db = {
 
   async recentClaims(limit = 50): Promise<Claim[]> {
     const rows = await read<Claim>(files.claims);
-    return rows
-      .slice()
-      .sort((a, b) => +new Date(b.ts) - +new Date(a.ts))
-      .slice(0, limit);
+    const deduped = dedupeClaimsBySig(rows);
+    return deduped.slice(0, limit);
   },
 
   async recentClaimsByWallet(wallet: string, limit = 50): Promise<Claim[]> {
     const rows = await read<Claim>(files.claims);
     const w = wallet.toLowerCase();
-    return rows
-      .filter(r => r.wallet.toLowerCase() === w)
-      .sort((a, b) => +new Date(b.ts) - +new Date(a.ts))
-      .slice(0, limit);
+    const deduped = dedupeClaimsBySig(rows);
+    return deduped.filter(r => r.wallet === w).slice(0, limit);
   },
 
   // ---- aggregates / metrics ----
   async addToTotalDistributed(amount: number) {
+    // Keep simple additive counter; caller should ensure idempotency by sig.
     const m = await readObj<Metrics>(files.metrics, { totalDistributedPump: 0 });
     m.totalDistributedPump = Number(m.totalDistributedPump || 0) + Number(amount || 0);
     await writeObj(files.metrics, m);
   },
 
-  /** Returns the *claimed* total. Prefer metrics.json; fallback to summing claims.json */
+  /** Returns the *claimed* total. Prefer metrics.json; fallback to sum(claims). */
   async totalDistributedPump(): Promise<number> {
     const m = await readObj<Metrics>(files.metrics, { totalDistributedPump: 0 });
     const fromMetrics = Number(m.totalDistributedPump || 0);
     if (fromMetrics > 0) return fromMetrics;
 
     const claims = await read<Claim>(files.claims);
-    return claims.reduce((acc, c) => acc + Number(c.amount || 0), 0);
+    const deduped = dedupeClaimsBySig(claims);
+    return deduped.reduce((acc, c) => acc + Number(c.amount || 0), 0);
   },
-
 };

@@ -9,43 +9,87 @@ import { connection, pubkeyFromEnv, PUMP_MINT } from "@/lib/solana";
 import { PublicKey, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
-/* ---------- utils ---------- */
-const noStore = { headers: { "cache-control": "no-store, no-cache, must-revalidate, max-age=0" } };
-const n = (v: any) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+/* ===== Config ===== */
+const TTL_MS = 60_000; // cache per latest snapshot (protects RPC)
+const TX_TTL_MS = 5 * 60_000; // cache per-tx parse (expensive RPC)
+const noStore = {
+  headers: {
+    "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
+    pragma: "no-cache",
+    expires: "0",
+  },
+};
 
-/** Safe tx fetch with 2 short retries (RPCs sometimes return null). */
-async function getTx(sig: string, commitment: "confirmed" | "finalized" = "confirmed") {
-  const conn = connection();
-  for (let i = 0; i < 3; i++) {
-    try {
-      const tx = await conn.getTransaction(sig, {
-        maxSupportedTransactionVersion: 0,
-        commitment,
-      });
-      if (tx) return tx;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 300));
-  }
-  return null;
+/* ===== RL (per IP) ===== */
+type Bucket = { tokens: number; ts: number };
+const IP_BUCKET = new Map<string, Bucket>();
+function allowIp(ip: string, ratePerMin: number) {
+  const now = Date.now();
+  const refill = ratePerMin / 60000;
+  const slot = IP_BUCKET.get(ip) ?? { tokens: ratePerMin, ts: now };
+  const tokens = Math.min(ratePerMin, slot.tokens + (now - slot.ts) * refill);
+  if (tokens < 1) { IP_BUCKET.set(ip, { tokens, ts: now }); return false; }
+  IP_BUCKET.set(ip, { tokens: tokens - 1, ts: now });
+  return true;
 }
 
+/* ===== Cache & single-flight ===== */
+type ProofsPayload = {
+  snapshotId: any;
+  snapshotTs: any;
+  snapshotHash: any;
+  pumpBalance: number;
+  deltaPump: number;
+  creatorSol: number;
+  pumpSwapped: number;
+  txs: { claimSig: string | null; claimSolscan?: string; swapSig: string | null; swapSolscan?: string };
+  previous: any[];
+};
+let SNAP_CACHE: { at: number; key: string; data: ProofsPayload } | null = null;
+let PENDING: Promise<ProofsPayload> | null = null;
+
+// Per-tx derived values cache (avoid re-decoding same tx)
+type TxCacheEntry = { at: number; creatorSol?: number; pumpSwapped?: number };
+const TX_CACHE = new Map<string, TxCacheEntry>();
+
+function cidOf(req: Request) {
+  return (
+    req.headers.get("x-request-id") ||
+    req.headers.get("cf-ray") ||
+    Math.random().toString(36).slice(2)
+  );
+}
+function n(v: any) { const x = Number(v); return Number.isFinite(x) ? x : 0; }
+
 async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<number> {
-  const tx = await getTx(sig, "finalized");
-  if (!tx?.meta) return 0;
+  const hit = TX_CACHE.get("creator:" + sig);
+  const now = Date.now();
+  if (hit && now - hit.at < TX_TTL_MS && typeof hit.creatorSol === "number") return hit.creatorSol!;
+  const conn = connection();
+  const tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+  if (!tx?.meta) { TX_CACHE.set("creator:" + sig, { at: now, creatorSol: 0 }); return 0; }
   const keys = tx.transaction.message.getAccountKeys().staticAccountKeys;
-  const i = keys.findIndex((k) => k.equals(target));
-  if (i < 0) return 0;
+  const i = keys.findIndex(k => k.equals(target));
+  if (i < 0) { TX_CACHE.set("creator:" + sig, { at: now, creatorSol: 0 }); return 0; }
   const pre = tx.meta.preBalances?.[i] ?? 0;
   const post = tx.meta.postBalances?.[i] ?? 0;
-  return (post - pre) / 1e9;
+  const deltaLamports = post - pre;
+  const val = deltaLamports / 1e9;
+  TX_CACHE.set("creator:" + sig, { at: now, creatorSol: val });
+  return val;
 }
 
 async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
-  const tx = await getTx(sig, "finalized");
-  if (!tx?.meta) return 0;
+  const hit = TX_CACHE.get("pump:" + sig);
+  const now = Date.now();
+  if (hit && now - hit.at < TX_TTL_MS && typeof hit.pumpSwapped === "number") return hit.pumpSwapped!;
+  const conn = connection();
+  const tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+  if (!tx?.meta) { TX_CACHE.set("pump:" + sig, { at: now, pumpSwapped: 0 }); return 0; }
 
   const pre = tx.meta.preTokenBalances || [];
   const post = tx.meta.postTokenBalances || [];
+
   const mintStr = PUMP_MINT.toBase58();
   const ownerLc = owner.toBase58().toLowerCase();
 
@@ -61,18 +105,17 @@ async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
       const key = String(q.accountIndex);
       const preAmt = preMap.get(key) ?? 0;
       const postAmt = Number(q.uiTokenAmount?.amount || 0);
-      deltaRaw += postAmt - preAmt;
+      deltaRaw += (postAmt - preAmt);
     }
   }
-  return deltaRaw / 1e6; // PUMP has 6 decimals
+  const val = deltaRaw / 1e6; // 6 decimals
+  TX_CACHE.set("pump:" + sig, { at: now, pumpSwapped: val });
+  return val;
 }
 
-/* ---------- db helpers (adapt to your file-db) ---------- */
 async function readLatestSnapshot(db: any) {
-  if (typeof db?.latestSnapshot === "function") return db.latestSnapshot();
-  if (db?.snapshot?.findFirst) {
-    return db.snapshot.findFirst({ orderBy: { cycleId: "desc" } });
-  }
+  if (db?.snapshot?.findFirst) return db.snapshot.findFirst({ orderBy: { cycleId: "desc" } });
+  if (db?.getLatestSnapshot) return db.getLatestSnapshot();
   if (db?.snapshot?.findMany) {
     const rows = await db.snapshot.findMany({ orderBy: { cycleId: "desc" }, take: 1 });
     return rows?.[0] || null;
@@ -81,18 +124,14 @@ async function readLatestSnapshot(db: any) {
 }
 
 async function readPreviousSnapshots(db: any, limit = 5) {
-  // file-db path: returns all; slice here
-  if (typeof db?.listSnapshots === "function") {
-    const all = await db.listSnapshots();
-    return all.slice(-1 - limit, -1).reverse(); // last N before latest
-  }
   if (db?.snapshot?.findMany) {
-    return db.snapshot.findMany({ orderBy: { cycleId: "desc" }, skip: 1, take: limit });
+    const rows = await db.snapshot.findMany({ orderBy: { cycleId: "desc" }, skip: 1, take: limit });
+    return rows;
   }
+  if (db?.listSnapshots) return db.listSnapshots(limit);
   return [];
 }
 
-/* Resolve DEV public key for creator-fee delta */
 function resolveDevPub(): PublicKey {
   try {
     return pubkeyFromEnv("DEV_WALLET");
@@ -105,128 +144,120 @@ function resolveDevPub(): PublicKey {
   throw new Error("Missing DEV_WALLET or DEV_WALLET_SECRET");
 }
 
-/* ---------- route ---------- */
-export async function GET() {
+async function computeProofs(): Promise<ProofsPayload> {
+  const { db } = await import("@/lib/db");
+  const treasury = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
+  const devPub = resolveDevPub();
+
+  // latest snapshot
+  const snap = await readLatestSnapshot(db);
+  if (!snap) {
+    return {
+      snapshotId: null,
+      snapshotTs: null,
+      snapshotHash: null,
+      pumpBalance: 0,
+      deltaPump: 0,
+      creatorSol: 0,
+      pumpSwapped: 0,
+      txs: { claimSig: null, swapSig: null },
+      previous: [],
+    };
+  }
+
+  const snapshotId = snap?.snapshotId ?? null;
+  const snapshotTs = snap?.snapshotTs ?? null;
+  const deltaPump = n(snap?.deltaPump); // UI units
+
+  // prep row for this cycle
+  const prep: any = (db as any)?.getPrep ? await (db as any).getPrep(snap?.cycleId || "") : null;
+
+  const claimSig: string | null = prep?.claimSig ?? null;
+  const swapSig: string | null =
+    prep?.swapSigTreas ??
+    ((Array.isArray(prep?.swapSigs) && prep.swapSigs.length > 0) ? prep.swapSigs[0] : null) ??
+    null;
+
+  // chain-derived amounts (cached per tx)
+  const creatorSol = claimSig ? await lamportsToSolFromTx(claimSig, devPub) : 0;
+  const pumpSwapped = swapSig ? await pumpDeltaFromTx(swapSig, treasury) : 0;
+
+  const previous = await readPreviousSnapshots(db, 5);
+
+  return {
+    snapshotId,
+    snapshotTs,
+    snapshotHash: snap?.holdersHash || null,
+    pumpBalance: deltaPump,
+    deltaPump,
+    creatorSol,
+    pumpSwapped,
+    txs: {
+      claimSig: claimSig || null,
+      claimSolscan: claimSig ? `https://solscan.io/tx/${encodeURIComponent(claimSig)}` : undefined,
+      swapSig: swapSig || null,
+      swapSolscan: swapSig ? `https://solscan.io/tx/${encodeURIComponent(swapSig)}` : undefined,
+    },
+    previous: (previous || []).map((p: any) => ({
+      snapshotId: p.snapshotId,
+      snapshotTs: p.snapshotTs,
+      snapshotHash: p.holdersHash,
+      deltaPump: n(p.deltaPump),
+      pumpBalance: n(p.deltaPump),
+      creatorSol: 0,
+      pumpSwapped: 0,
+      txs: p.txs || {},
+    })),
+  };
+}
+
+export async function GET(req: Request) {
+  const cid = cidOf(req);
+
+  // Per-IP throttle (reads only, but avoid spam): 60/min
+  const ip =
+    (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
+    req.headers.get("x-real-ip") ||
+    "unknown";
+  if (!allowIp(ip, 60)) {
+    console.warn(JSON.stringify({ cid, where: "proofs.GET", ip, err: "rate_limited_ip" }));
+    return NextResponse.json(
+      { snapshotId: null, snapshotTs: null, snapshotHash: null, pumpBalance: 0, deltaPump: 0, creatorSol: 0, pumpSwapped: 0, txs: {}, previous: [], error: "Too Many Requests (ip)" },
+      { status: 429, ...noStore }
+    );
+  }
+
   try {
     const { db } = await import("@/lib/db");
-    const treasury = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
-    const devPub = resolveDevPub();
 
-    // latest snapshot
-    const snap = await readLatestSnapshot(db);
-    if (!snap) {
-      return NextResponse.json(
-        {
-          snapshotId: null,
-          snapshotTs: null,
-          snapshotHash: null,
-          pumpBalance: 0,
-          deltaPump: 0,
-          creatorSol: 0,
-          pumpSwapped: 0,
-          txs: {},
-          previous: [],
-        },
-        noStore
-      );
+    // cache key is latest cycleId (falls back to "none")
+    const latest = await readLatestSnapshot(db);
+    const key = latest?.cycleId ? String(latest.cycleId) : "none";
+    const now = Date.now();
+
+    if (SNAP_CACHE && SNAP_CACHE.key === key && now - SNAP_CACHE.at < TTL_MS) {
+      return NextResponse.json(SNAP_CACHE.data, noStore);
     }
 
-    const snapshotId = snap.snapshotId ?? null;
-    const snapshotTs = snap.snapshotTs ?? null;
-    const deltaPump = n(snap.deltaPump);
-
-    // pull the PREP row for the same cycle
-    const prep: any = typeof db.getPrep === "function" ? await db.getPrep(String(snap.cycleId || "")) : null;
-
-    // prefer the authoritative fields written by prepare-drop
-    const claimSig: string | null = prep?.claimSig ?? null;
-    const swapSig: string | null =
-      prep?.swapSigTreas ??
-      (Array.isArray(prep?.swapSigs) && prep.swapSigs.length > 0 ? prep.swapSigs[0] : null) ??
-      null;
-
-    // derive from chain, but fall back to persisted prep numbers if RPC is flaky
-    let creatorSol = 0;
-    if (claimSig) {
-      try {
-        creatorSol = await lamportsToSolFromTx(claimSig, devPub);
-      } catch {}
-    }
-    if (creatorSol === 0 && n(prep?.creatorSolDelta) > 0) {
-      creatorSol = n(prep.creatorSolDelta); // fallback to recorded SOL delta on DEV
+    if (!PENDING) {
+      PENDING = computeProofs()
+        .then((data) => {
+          SNAP_CACHE = { at: Date.now(), key, data };
+          return data;
+        })
+        .finally(() => setTimeout(() => { PENDING = null; }, 50));
     }
 
-    let pumpSwapped = 0;
-    if (swapSig) {
-      try {
-        pumpSwapped = await pumpDeltaFromTx(swapSig, treasury);
-      } catch {}
-    }
-    if (pumpSwapped === 0 && n(prep?.swapOutPumpUi) > 0) {
-      pumpSwapped = n(prep.swapOutPumpUi); // fallback to recorded outAmount
-    }
-
-    // previous snapshots (metadata + tx refs if any); keep chain-light
-    const prevSnaps: any[] = await readPreviousSnapshots(db, 5);
-    const previous = await Promise.all(
-      (prevSnaps || []).map(async (p: any) => {
-        const prevPrep = typeof db.getPrep === "function" ? await db.getPrep(String(p.cycleId || "")) : null;
-        const prevClaimSig = prevPrep?.claimSig ?? null;
-        const prevSwapSig =
-          prevPrep?.swapSigTreas ??
-          (Array.isArray(prevPrep?.swapSigs) && prevPrep.swapSigs.length > 0 ? prevPrep.swapSigs[0] : null) ??
-          null;
-        return {
-          snapshotId: p.snapshotId,
-          snapshotTs: p.snapshotTs,
-          snapshotHash: p.holdersHash,
-          deltaPump: n(p.deltaPump),
-          pumpBalance: n(p.deltaPump),
-          creatorSol: 0,               // keep zero to avoid extra RPC; UI shows link if present
-          pumpSwapped: 0,              // same; we display links below
-          txs: {
-            claimSig: prevClaimSig || null,
-            swapSig: prevSwapSig || null,
-          },
-        };
-      })
-    );
-
-    return NextResponse.json(
-      {
-        snapshotId,
-        snapshotTs,
-        snapshotHash: snap?.holdersHash || null,
-        pumpBalance: deltaPump,
-        deltaPump,
-
-        creatorSol,
-        pumpSwapped,
-
-        txs: {
-          claimSig: claimSig || null,
-          swapSig: swapSig || null,
-        },
-
-        previous,
-      },
-      noStore
-    );
+    const data = await PENDING;
+    console.info(JSON.stringify({ cid, where: "proofs.GET", key, ok: true }));
+    return NextResponse.json(data, noStore);
   } catch (e: any) {
-    console.error("proofs route error:", e);
+    console.error(JSON.stringify({ cid, where: "proofs.GET", error: String(e?.message || e) }));
+    // serve stale if available
+    if (SNAP_CACHE) return NextResponse.json(SNAP_CACHE.data, noStore);
     return NextResponse.json(
-      {
-        snapshotId: null,
-        snapshotTs: null,
-        snapshotHash: null,
-        pumpBalance: 0,
-        deltaPump: 0,
-        creatorSol: 0,
-        pumpSwapped: 0,
-        txs: {},
-        previous: [],
-      },
-      noStore
+      { snapshotId: null, snapshotTs: null, snapshotHash: null, pumpBalance: 0, deltaPump: 0, creatorSol: 0, pumpSwapped: 0, txs: {}, previous: [], error: "proofs failed" },
+      { status: 502, ...noStore }
     );
   }
 }
