@@ -26,6 +26,7 @@ import { db } from "@/lib/db";
 const DROP_SECRET = process.env.DROP_SECRET || "";
 const RATE_PER_MIN_IP = 30;
 const RATE_PER_MIN_WALLET = 30;
+const ENTITLEMENT_IS_RAW = String(process.env.ENTITLEMENT_IS_RAW || "").toLowerCase() === "true";
 
 const FALLBACK_RPC =
   process.env.SOLANA_RPC_FALLBACK ||
@@ -116,7 +117,6 @@ export async function POST(req: Request) {
   const cid = cidOf(req);
 
   try {
-    // Optional secret: if provided & mismatched, reject; never required.
     if (DROP_SECRET) {
       const provided = req.headers.get("x-drop-secret");
       if (provided && provided !== DROP_SECRET) {
@@ -152,16 +152,17 @@ export async function POST(req: Request) {
       return bad(429, "Too Many Requests (wallet)");
     }
 
-    // === Re-derive entitlements server-side (anti-tamper + idempotent) ===
+    // === Re-derive entitlements (UI units) ===
     const ent = await db.listWalletEntitlements(userLc);
     const isInSnapshot = new Set(snapshotIds);
+
     let newlyUi = 0;
     let totalUi = 0;
 
     for (const r of ent) {
       if (!isInSnapshot.has(String(r.snapshotId))) continue;
       const a = Number(r.amount || 0);
-      const ui = Number.isFinite(a) ? a : 0;
+      const ui = Number.isFinite(a) ? (ENTITLEMENT_IS_RAW ? a / 1e6 : a) : 0;
       totalUi += ui;
       if (!r.claimed) newlyUi += ui;
     }
@@ -183,7 +184,7 @@ export async function POST(req: Request) {
       return bad(400, "Invalid fee payer");
     }
 
-    // === Build the EXPECTED claim message (with the SAME blockhash the user signed) ===
+    // === Build the EXPECTED claim message with the SAME blockhash ===
     const primaryConn = connection();
     const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
     const tokenProgramId = await getMintTokenProgramId(primaryConn, PUMP_MINT);
@@ -201,38 +202,22 @@ export async function POST(req: Request) {
     const expectedIxs = [
       ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
       createAssociatedTokenAccountIdempotentInstruction(
-        userPk,        // payer
-        fromAta,       // treasury ATA
-        treasuryPubkey,
-        PUMP_MINT,
-        tokenProgramId
+        userPk, fromAta, treasuryPubkey, PUMP_MINT, tokenProgramId
       ),
       createAssociatedTokenAccountIdempotentInstruction(
-        userPk,        // payer
-        toAta,         // user ATA
-        userPk,
-        PUMP_MINT,
-        tokenProgramId
+        userPk, toAta, userPk, PUMP_MINT, tokenProgramId
       ),
       ...(feeLamports > 0
         ? [SystemProgram.transfer({ fromPubkey: userPk, toPubkey: treasuryPubkey, lamports: feeLamports })]
         : []),
       createTransferCheckedInstruction(
-        fromAta,
-        PUMP_MINT,
-        toAta,
-        treasuryPubkey,    // authority co-signed server-side
-        rawAmount,
-        DECIMALS,
-        [],
-        tokenProgramId
+        fromAta, PUMP_MINT, toAta, treasuryPubkey, rawAmount, DECIMALS, [], tokenProgramId
       ),
     ];
 
-    // Use the SAME recentBlockhash as the signed tx so messages can match exactly
     const expectedMsg = new TransactionMessage({
       payerKey: userPk,
-      recentBlockhash: tx.message.recentBlockhash,
+      recentBlockhash: tx.message.recentBlockhash, // ← use the user’s blockhash
       instructions: expectedIxs,
     }).compileToV0Message();
 
@@ -240,7 +225,6 @@ export async function POST(req: Request) {
     const actualMsgB64   = Buffer.from(tx.message.serialize()).toString("base64");
 
     if (expectedMsgB64 !== actualMsgB64) {
-      // Hard fail: user-signed message isn’t the allowed claim format/amount
       return bad(400, "Submitted transaction does not match the issued preview");
     }
 
@@ -255,36 +239,16 @@ export async function POST(req: Request) {
       return bad(502, "Upstream relay error", { detail: String(e?.message || e).slice(0, 200) });
     }
 
-    // Non-blocking confirm
     try { await primaryConn.confirmTransaction(sig, "confirmed"); } catch {}
 
-    // === Mark claimed (idempotent) & update metrics ONLY for newly claimed ===
-    try {
-      if ((db as any).markEntitlementsClaimed) {
-        await (db as any).markEntitlementsClaimed(userLc, snapshotIds, sig);
-      }
-    } catch {}
-    try {
-      await db.insertRecentClaim({
-        wallet: userBase58,
-        amount: newlyUi,
-        sig,
-        ts: new Date().toISOString(),
-      });
-    } catch {}
+    // Mark claimed + feed + metrics
+    try { if ((db as any).markEntitlementsClaimed) await (db as any).markEntitlementsClaimed(userLc, snapshotIds, sig); } catch {}
+    try { await db.insertRecentClaim({ wallet: userBase58, amount: newlyUi, sig, ts: new Date().toISOString() }); } catch {}
     try { await db.addToTotalDistributed(newlyUi); } catch {}
 
     const solscan = `https://solscan.io/tx/${encodeURIComponent(sig)}`;
 
-    console.info(JSON.stringify({
-      cid,
-      where: "claim-submit",
-      wallet: userBase58,
-      sig,
-      snapshots: snapshotIds.length,
-      newlyUi,
-    }));
-
+    console.info(JSON.stringify({ cid, where: "claim-submit", wallet: userBase58, sig, snapshots: snapshotIds.length, newlyUi }));
     return json({ ok: true, sig, solscan, claimed: newlyUi });
   } catch (e: any) {
     console.error(JSON.stringify({ cid, where: "claim-submit", error: String(e?.message || e) }));
