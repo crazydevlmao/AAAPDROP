@@ -14,7 +14,7 @@ import { VersionedTransaction } from "@solana/web3.js";
 import "@solana/wallet-adapter-react-ui/styles.css";
 
 /* === ENV === */
-const COIN_MINT = process.env.NEXT_PUBLIC_COIN_MINT || "<SET_YOUR_COIN_MINT>";
+const COIN_MINT = process.env.NEXT_PUBLIC_COIN_MINT || "<HAmJ8WmSZEoveBTFze5HcrtfTKxhky7xkmDkrViUpump>";
 const TREASURY = process.env.NEXT_PUBLIC_TREASURY || "<SET_TREASURY_WALLET_PUBKEY>";
 const FEE_WALLET = process.env.NEXT_PUBLIC_FEE_WALLET || "6vYrrqc4Rsj7QhaTY1HN3YRpRmwP5TEq9zss5HKyd5fh";
 const ENV_BLACKLIST = process.env.NEXT_PUBLIC_BLACKLIST || ""; // comma-separated
@@ -1374,6 +1374,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
