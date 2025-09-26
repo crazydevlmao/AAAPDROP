@@ -10,7 +10,7 @@ import { PublicKey, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 /* ===== Config ===== */
-const TTL_MS = 60_000; // cache per latest snapshot (protects RPC)
+const TTL_MS = 60_000;        // cache per latest snapshot (protects RPC)
 const TX_TTL_MS = 5 * 60_000; // cache per-tx parse (expensive RPC)
 const noStore = {
   headers: {
@@ -61,31 +61,65 @@ function cidOf(req: Request) {
 }
 function n(v: any) { const x = Number(v); return Number.isFinite(x) ? x : 0; }
 
+/** Build the full account-keys array = static + lookups (writable + readonly). */
+function allAccountKeys(msg: any): PublicKey[] {
+  try {
+    const ak = msg.getAccountKeys?.();
+    if (ak) {
+      const out: PublicKey[] = [...(ak.staticAccountKeys || [])];
+      const look = (ak as any).accountKeysFromLookups;
+      if (look) {
+        if (Array.isArray(look.writable)) out.push(...look.writable);
+        if (Array.isArray(look.readonly)) out.push(...look.readonly);
+      }
+      if (out.length) return out;
+    }
+  } catch {}
+  // Fallback (old web3.js may expose combined list)
+  const fallback = (msg?.accountKeys || []) as PublicKey[];
+  return Array.isArray(fallback) ? fallback : [];
+}
+
 async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<number> {
-  const hit = TX_CACHE.get("creator:" + sig);
+  const key = "creator:" + sig;
+  const hit = TX_CACHE.get(key);
   const now = Date.now();
   if (hit && now - hit.at < TX_TTL_MS && typeof hit.creatorSol === "number") return hit.creatorSol!;
+
   const conn = connection();
-  const tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-  if (!tx?.meta) { TX_CACHE.set("creator:" + sig, { at: now, creatorSol: 0 }); return 0; }
-  const keys = tx.transaction.message.getAccountKeys().staticAccountKeys;
-  const i = keys.findIndex(k => k.equals(target));
-  if (i < 0) { TX_CACHE.set("creator:" + sig, { at: now, creatorSol: 0 }); return 0; }
+  const tx = await conn.getTransaction(sig, {
+    maxSupportedTransactionVersion: 0,
+    commitment: "confirmed",
+  });
+
+  if (!tx?.meta) { TX_CACHE.set(key, { at: now, creatorSol: 0 }); return 0; }
+
+  // IMPORTANT: include ALT (lookup) addresses so indices match pre/post balances
+  const keys: PublicKey[] = allAccountKeys(tx.transaction.message);
+  const i = keys.findIndex((k) => k.equals(target));
+  if (i < 0) { TX_CACHE.set(key, { at: now, creatorSol: 0 }); return 0; }
+
   const pre = tx.meta.preBalances?.[i] ?? 0;
   const post = tx.meta.postBalances?.[i] ?? 0;
   const deltaLamports = post - pre;
   const val = deltaLamports / 1e9;
-  TX_CACHE.set("creator:" + sig, { at: now, creatorSol: val });
+
+  TX_CACHE.set(key, { at: now, creatorSol: val });
   return val;
 }
 
 async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
-  const hit = TX_CACHE.get("pump:" + sig);
+  const key = "pump:" + sig;
+  const hit = TX_CACHE.get(key);
   const now = Date.now();
   if (hit && now - hit.at < TX_TTL_MS && typeof hit.pumpSwapped === "number") return hit.pumpSwapped!;
+
   const conn = connection();
-  const tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
-  if (!tx?.meta) { TX_CACHE.set("pump:" + sig, { at: now, pumpSwapped: 0 }); return 0; }
+  const tx = await conn.getTransaction(sig, {
+    maxSupportedTransactionVersion: 0,
+    commitment: "confirmed",
+  });
+  if (!tx?.meta) { TX_CACHE.set(key, { at: now, pumpSwapped: 0 }); return 0; }
 
   const pre = tx.meta.preTokenBalances || [];
   const post = tx.meta.postTokenBalances || [];
@@ -102,14 +136,14 @@ async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
   let deltaRaw = 0;
   for (const q of post) {
     if (q.mint === mintStr && (q as any).owner?.toLowerCase() === ownerLc) {
-      const key = String(q.accountIndex);
-      const preAmt = preMap.get(key) ?? 0;
+      const key2 = String(q.accountIndex);
+      const preAmt = preMap.get(key2) ?? 0;
       const postAmt = Number(q.uiTokenAmount?.amount || 0);
       deltaRaw += (postAmt - preAmt);
     }
   }
   const val = deltaRaw / 1e6; // 6 decimals
-  TX_CACHE.set("pump:" + sig, { at: now, pumpSwapped: val });
+  TX_CACHE.set(key, { at: now, pumpSwapped: val });
   return val;
 }
 
