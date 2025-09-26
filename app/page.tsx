@@ -64,9 +64,10 @@ function formatUSD(n: number) {
   return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 }
 function formatMintForHeader(mint?: string) {
-  if (!mint || mint.length < 8) return "----.----PUMP";
-  return `${mint.slice(0, 4)}.${mint.slice(-4)}PUMP`;
+  if (!mint || mint.length < 8) return "----.----";
+  return `${mint.slice(0, 4)}.${mint.slice(-4)}`;
 }
+
 /* Relative time helper for feed/history */
 function timeAgo(iso: string, now = new Date()) {
   const t = new Date(iso).getTime();
@@ -1331,5 +1332,6 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
