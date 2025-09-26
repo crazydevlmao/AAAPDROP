@@ -27,6 +27,10 @@ const RPC_ENDPOINT =
   process.env.SOLANA_RPC ||
   "https://api.mainnet-beta.solana.com";
 
+/* === ADDED: gentle client triggers offsets (prep/snapshot) === */
+const PREP_OFFSET_SECONDS = Number(process.env.PREP_OFFSET_SECONDS || 120);
+const SNAPSHOT_OFFSET_SECONDS = Number(process.env.SNAPSHOT_OFFSET_SECONDS || 8);
+
 /* === Utils === */
 function nextBoundary(minutes = CYCLE_MINUTES, from = new Date()) {
   const d = new Date(from);
@@ -185,7 +189,7 @@ function ConnectButton() {
 
 /* === Inner App === */
 function InnerApp() {
-  useConnection(); // not used directly, but keeps adapter happy
+  useConnection(); // keep adapter happy
   const { publicKey, signTransaction, connected } = useWallet();
 
   /* Toast state */
@@ -387,24 +391,22 @@ function InnerApp() {
       }
 
       // --- Phantom signs FIRST ---
-const unsignedTx = VersionedTransaction.deserialize(b64ToU8a(txB64));
-const userSigned = await signTransaction(unsignedTx);
-const signedTxB64 = u8aToB64(userSigned.serialize());
+      const unsignedTx = VersionedTransaction.deserialize(b64ToU8a(txB64));
+      const userSigned = await signTransaction(unsignedTx);
+      const signedTxB64 = u8aToB64(userSigned.serialize());
 
-// Send to server for additional signer + broadcast
-const submit = await fetch("/api/claim-submit", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    wallet: publicKey.toBase58(),
-    signedTxB64,
-    unsignedTxB64: txB64,   // ← add this line
-    snapshotIds: snapIds,
-    amount: amountToClaim,
-  }),
-}).then(r => r.json());
-
-
+      // Send to server for additional signer + broadcast
+      const submit = await fetch("/api/claim-submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          wallet: publicKey.toBase58(),
+          signedTxB64,
+          unsignedTxB64: txB64,   // ← keep this
+          snapshotIds: snapIds,
+          amount: amountToClaim,
+        }),
+      }).then(r => r.json());
 
       if (!submit?.ok || !submit?.sig) throw new Error(submit?.error || "submit failed");
       const sig = submit.sig as string;
@@ -493,6 +495,94 @@ const submit = await fetch("/api/claim-submit", {
     return rankMap.get(me) ?? null;
   }, [rankMap, publicKey?.toBase58?.()]);
 
+  /* === ADDED: "How it works" modal toggle === */
+  const [showHow, setShowHow] = useState(false);
+
+  /* === ADDED: Client-side gentle triggers near end of cycle (+ green popup) === */
+  const didPrepareRef = useRef(false);
+  const didPreSnapshotRef = useRef(false);
+  useEffect(() => {
+    const secLeft = Math.floor(msLeft / 1000);
+
+   -  // T-120s (prep)
+-  if (!didPrepareRef.current &&
+-      secLeft <= PREP_OFFSET_SECONDS &&
+-      secLeft > PREP_OFFSET_SECONDS - 2) {
+-    didPrepareRef.current = true;
+-    fetch("/api/prepare-drop", { method: "POST" }).catch(() => {});
+-  }
++  // T-120s (prep) — warm caches only (do NOT call server prep from client)
++  if (!didPrepareRef.current &&
++      secLeft <= PREP_OFFSET_SECONDS &&
++      secLeft > PREP_OFFSET_SECONDS - 2) {
++    didPrepareRef.current = true;
++    Promise.allSettled([refreshProofs(), refreshMetrics()]).catch(() => {});
++  }
+
+-  // T-8s (snapshot) — fetch holders/proofs and show green toast
+-  if (!didPreSnapshotRef.current &&
+-      secLeft <= SNAPSHOT_OFFSET_SECONDS &&
+-      secLeft > SNAPSHOT_OFFSET_SECONDS - 2) {
+-    didPreSnapshotRef.current = true;
+-    (async () => {
+-      try {
+-        const url = new URL("/api/snapshot", window.location.origin);
+-        url.searchParams.set("mint", COIN_MINT);
+-        url.searchParams.set("min", "10000");
+-        url.searchParams.set("blacklist", Array.from(blacklistSet).join(","));
+-        const data = await fetch(url.toString(), { cache: "no-store" }).then((r) => r.json());
+-        if (Array.isArray(data?.holders)) setHolders(data.holders);
+-        if (data?.pumpBalance) setPumpBalance(Number(data.pumpBalance) || 0);
+-        if (data?.snapshotTs) setSnapshotTs(data.snapshotTs);
+-        if (data?.snapshotId) setSnapshotId(data.snapshotId);
+-      } catch {}
+-      await Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]);
+-      showToast("New drop is ready — claim your $PUMP!", "success");
+-    })();
+-  }
++  // T-8s (snapshot window) — just refresh views (worker does the snapshot)
++  if (!didPreSnapshotRef.current &&
++      secLeft <= SNAPSHOT_OFFSET_SECONDS &&
++      secLeft > SNAPSHOT_OFFSET_SECONDS - 2) {
++    didPreSnapshotRef.current = true;
++    (async () => {
++      await Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]);
++      // pull holders (server caches)
++      fetch("/api/holders", { cache: "no-store" })
++        .then((r) => r.json())
++        .then((j) => Array.isArray(j?.holders) && setHolders(j.holders))
++        .catch(() => {});
++      showToast("New drop is ready — claim your $PUMP!", "success");
++    })();
++  }
+
+
+    // Reset flags right after boundary
+    if (secLeft <= 0) {
+      didPrepareRef.current = false;
+      didPreSnapshotRef.current = false;
+    }
+  }, [msLeft, blacklistSet]);
+
+  /* === ADDED: tiny post-boundary reconciliation (belt & suspenders) === */
+  const lastBoundaryRef = useRef<number>(targetTs.getTime());
+  useEffect(() => {
+    const cur = targetTs.getTime();
+    if (cur !== lastBoundaryRef.current) {
+      lastBoundaryRef.current = cur;
+      // Small delayed refresh in case users arrived late to page
+      const t = setTimeout(() => {
+        Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]).then(() => {
+          fetch("/api/holders", { cache: "no-store" })
+            .then((r) => r.json())
+            .then((j) => Array.isArray(j?.holders) && setHolders(j.holders))
+            .catch(() => {});
+        });
+      }, 1500);
+      return () => clearTimeout(t);
+    }
+  }, [targetTs]);
+
   return (
     <div className="min-h-screen relative">
       <div className="grid-overlay" />
@@ -533,6 +623,16 @@ const submit = await fetch("/api/claim-submit", {
               <path fill="currentColor" d="M18.9 3H22l-7.7 8.8L22.8 21H17l-5-6l-5.6 6H2.3l8.4-9.2L2 3h5.1l4.5 5.4L18.9 3z" />
             </svg>
           </a>
+
+          {/* === ADDED: How it works button (top-right) === */}
+          <button
+            onClick={() => setShowHow(true)}
+            className="wiggle-2s px-4 py-2 rounded-xl border border-[#2a2a33] bg-[#111118] hover:bg-[#16161c] text-sm"
+            title="How it works"
+          >
+            How it works
+          </button>
+
           <button
             onClick={handleClaim}
             className={`px-4 py-2 rounded-xl text-sm ${connected ? "bg-[var(--accent)] text-black hover:brightness-95" : "bg-[#111118] border border-[#2a2a33] opacity-80"}`}
@@ -796,169 +896,168 @@ const submit = await fetch("/api/claim-submit", {
 
         {/* POW */}
         {tab === "proofs" && (
-  <section className="card mb-12">
-    <h3 className="font-semibold mb-3">On-chain Proof Of Work</h3>
+          <section className="card mb-12">
+            <h3 className="font-semibold mb-3">On-chain Proof Of Work</h3>
 
-    {/* Latest snapshot core fields */}
-    <div className="grid sm:grid-cols-2 gap-3 text-sm">
-      <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
-        <div className="opacity-60 text-xs">Latest Snapshot ID</div>
-        <div className="font-mono break-all">{snapshotId || proofs?.snapshotId || "—"}</div>
-      </div>
-      <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
-        <div className="opacity-60 text-xs">Snapshot Time</div>
-        <div>{snapshotTs ? new Date(snapshotTs).toLocaleString() : (proofs?.snapshotTs || "—")}</div>
-      </div>
-
-      <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
-        <div className="opacity-60 text-xs">Snapshot Hash</div>
-        <div className="font-mono break-all">{proofs?.snapshotHash || "—"}</div>
-      </div>
-
-      <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
-        <div className="opacity-60 text-xs">Delta $PUMP (allocated this cycle)</div>
-        <div>{(proofs?.pumpBalance || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })}</div>
-      </div>
-    </div>
-
-    {/* Tx evidence cards */}
-    <div className="grid sm:grid-cols-2 gap-3 mt-3 text-sm">
-      <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f] flex items-center justify-between">
-        <div>
-          <div className="opacity-60 text-xs">Creator rewards (SOL, this cycle)</div>
-          <div className="font-semibold">
-            {(proofs?.creatorSol || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} SOL
-          </div>
-        </div>
-        {proofs?.txs?.claimSig ? (
-          <a
-            className="text-xs underline opacity-80"
-            target="_blank"
-            rel="noreferrer"
-            href={`https://solscan.io/tx/${proofs.txs.claimSig}`}
-          >
-            View on Solscan
-          </a>
-        ) : (
-          <span className="text-xs opacity-50">—</span>
-        )}
-      </div>
-
-      <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f] flex items-center justify-between">
-        <div>
-          <div className="opacity-60 text-xs">$PUMP swapped (this cycle)</div>
-          <div className="font-semibold">
-            {(proofs?.pumpSwapped || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
-          </div>
-        </div>
-        {proofs?.txs?.swapSig ? (
-          <a
-            className="text-xs underline opacity-80"
-            target="_blank"
-            rel="noreferrer"
-            href={`https://solscan.io/tx/${proofs.txs.swapSig}`}
-          >
-            View on Solscan
-          </a>
-        ) : (
-          <span className="text-xs opacity-50">—</span>
-        )}
-      </div>
-    </div>
-
-    {/* Previous snapshots (foldable, no React state) */}
-    <div className="mt-5">
-      <details className="group rounded-lg">
-        <summary className="cursor-pointer px-3 py-2 rounded-lg text-xs bg-[#17171d] border border-[#24242f]">
-          <span className="group-open:hidden">Show previous snapshots</span>
-          <span className="hidden group-open:inline">Hide previous snapshots</span>
-        </summary>
-
-        <div className="mt-3 space-y-2">
-          {(proofs?.previous ?? []).length === 0 && (
-            <div className="opacity-60 text-sm">No previous snapshots yet.</div>
-          )}
-
-          {(proofs?.previous ?? []).map((p: any, idx: number) => (
-            <details key={p.snapshotId || idx} className="group rounded-lg bg-[#101017] border border-[#24242f]">
-              <summary className="cursor-pointer px-3 py-2 text-sm flex items-center justify-between">
-                <span className="font-mono">
-                  {p.snapshotTs ? new Date(p.snapshotTs).toLocaleString() : "—"} · {p.snapshotId || "—"}
-                </span>
-                <span className="opacity-60 text-xs group-open:hidden">Click to expand</span>
-                <span className="opacity-60 text-xs hidden group-open:inline">Click to collapse</span>
-              </summary>
-
-              <div className="px-3 pb-3 grid sm:grid-cols-2 gap-3 text-sm">
-                <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f]">
-                  <div className="opacity-60 text-xs">Snapshot Hash</div>
-                  <div className="font-mono break-all">{p.snapshotHash || p.holdersHash || "—"}</div>
-                </div>
-                <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f]">
-                  <div className="opacity-60 text-xs">Delta $PUMP (allocated)</div>
-                  <div>{(p.pumpBalance ?? p.deltaPump ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 })}</div>
-                </div>
-
-                <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f] flex items-center justify-between">
-                  <div>
-                    <div className="opacity-60 text-xs">Creator rewards (SOL)</div>
-                    <div className="font-semibold">
-                      {(p.creatorSol || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} SOL
-                    </div>
-                  </div>
-                  {p?.txs?.claimSig ? (
-                    <a
-                      className="text-xs underline opacity-80"
-                      target="_blank"
-                      rel="noreferrer"
-                      href={`https://solscan.io/tx/${p.txs.claimSig}`}
-                    >
-                      Solscan
-                    </a>
-                  ) : (
-                    <span className="text-xs opacity-50">—</span>
-                  )}
-                </div>
-
-                <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f] flex items-center justify-between">
-                  <div>
-                    <div className="opacity-60 text-xs">$PUMP swapped</div>
-                    <div className="font-semibold">
-                      {(p.pumpSwapped || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
-                    </div>
-                  </div>
-                  {p?.txs?.swapSig ? (
-                    <a
-                      className="text-xs underline opacity-80"
-                      target="_blank"
-                      rel="noreferrer"
-                      href={`https://solscan.io/tx/${p.txs.swapSig}`}
-                    >
-                      Solscan
-                    </a>
-                  ) : (
-                    <span className="text-xs opacity-50">—</span>
-                  )}
-                </div>
-
-                {/* CSV download if present */}
-                {p.csv ? (
-                  <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f] flex items-center justify-between">
-                    <div className="opacity-60 text-xs">Snapshot holders CSV</div>
-                    <a className="text-xs underline opacity-80" href={p.csv}>
-                      Download
-                    </a>
-                  </div>
-                ) : null}
+            {/* Latest snapshot core fields */}
+            <div className="grid sm:grid-cols-2 gap-3 text-sm">
+              <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
+                <div className="opacity-60 text-xs">Latest Snapshot ID</div>
+                <div className="font-mono break-all">{snapshotId || proofs?.snapshotId || "—"}</div>
               </div>
-            </details>
-          ))}
-        </div>
-      </details>
-    </div>
-  </section>
-)}
+              <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
+                <div className="opacity-60 text-xs">Snapshot Time</div>
+                <div>{snapshotTs ? new Date(snapshotTs).toLocaleString() : (proofs?.snapshotTs || "—")}</div>
+              </div>
 
+              <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
+                <div className="opacity-60 text-xs">Snapshot Hash</div>
+                <div className="font-mono break-all">{proofs?.snapshotHash || "—"}</div>
+              </div>
+
+              <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f]">
+                <div className="opacity-60 text-xs">Delta $PUMP (allocated this cycle)</div>
+                <div>{(proofs?.pumpBalance || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })}</div>
+              </div>
+            </div>
+
+            {/* Tx evidence cards */}
+            <div className="grid sm:grid-cols-2 gap-3 mt-3 text-sm">
+              <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f] flex items-center justify-between">
+                <div>
+                  <div className="opacity-60 text-xs">Creator rewards (SOL, this cycle)</div>
+                  <div className="font-semibold">
+                    {(proofs?.creatorSol || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} SOL
+                  </div>
+                </div>
+                {proofs?.txs?.claimSig ? (
+                  <a
+                    className="text-xs underline opacity-80"
+                    target="_blank"
+                    rel="noreferrer"
+                    href={`https://solscan.io/tx/${proofs.txs.claimSig}`}
+                  >
+                    View on Solscan
+                  </a>
+                ) : (
+                  <span className="text-xs opacity-50">—</span>
+                )}
+              </div>
+
+              <div className="rounded-lg p-3 bg-[#101017] border border-[#24242f] flex items-center justify-between">
+                <div>
+                  <div className="opacity-60 text-xs">$PUMP swapped (this cycle)</div>
+                  <div className="font-semibold">
+                    {(proofs?.pumpSwapped || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
+                  </div>
+                </div>
+                {proofs?.txs?.swapSig ? (
+                  <a
+                    className="text-xs underline opacity-80"
+                    target="_blank"
+                    rel="noreferrer"
+                    href={`https://solscan.io/tx/${proofs.txs.swapSig}`}
+                  >
+                    View on Solscan
+                  </a>
+                ) : (
+                  <span className="text-xs opacity-50">—</span>
+                )}
+              </div>
+            </div>
+
+            {/* Previous snapshots (foldable, no React state) */}
+            <div className="mt-5">
+              <details className="group rounded-lg">
+                <summary className="cursor-pointer px-3 py-2 rounded-lg text-xs bg-[#17171d] border border-[#24242f]">
+                  <span className="group-open:hidden">Show previous snapshots</span>
+                  <span className="hidden group-open:inline">Hide previous snapshots</span>
+                </summary>
+
+                <div className="mt-3 space-y-2">
+                  {(proofs?.previous ?? []).length === 0 && (
+                    <div className="opacity-60 text-sm">No previous snapshots yet.</div>
+                  )}
+
+                  {(proofs?.previous ?? []).map((p: any, idx: number) => (
+                    <details key={p.snapshotId || idx} className="group rounded-lg bg-[#101017] border border-[#24242f]">
+                      <summary className="cursor-pointer px-3 py-2 text-sm flex items-center justify-between">
+                        <span className="font-mono">
+                          {p.snapshotTs ? new Date(p.snapshotTs).toLocaleString() : "—"} · {p.snapshotId || "—"}
+                        </span>
+                        <span className="opacity-60 text-xs group-open:hidden">Click to expand</span>
+                        <span className="opacity-60 text-xs hidden group-open:inline">Click to collapse</span>
+                      </summary>
+
+                      <div className="px-3 pb-3 grid sm:grid-cols-2 gap-3 text-sm">
+                        <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f]">
+                          <div className="opacity-60 text-xs">Snapshot Hash</div>
+                          <div className="font-mono break-all">{p.snapshotHash || p.holdersHash || "—"}</div>
+                        </div>
+                        <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f]">
+                          <div className="opacity-60 text-xs">Delta $PUMP (allocated)</div>
+                          <div>{(p.pumpBalance ?? p.deltaPump ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 })}</div>
+                        </div>
+
+                        <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f] flex items-center justify-between">
+                          <div>
+                            <div className="opacity-60 text-xs">Creator rewards (SOL)</div>
+                            <div className="font-semibold">
+                              {(p.creatorSol || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} SOL
+                            </div>
+                          </div>
+                          {p?.txs?.claimSig ? (
+                            <a
+                              className="text-xs underline opacity-80"
+                              target="_blank"
+                              rel="noreferrer"
+                              href={`https://solscan.io/tx/${p.txs.claimSig}`}
+                            >
+                              Solscan
+                            </a>
+                          ) : (
+                            <span className="text-xs opacity-50">—</span>
+                          )}
+                        </div>
+
+                        <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f] flex items-center justify-between">
+                          <div>
+                            <div className="opacity-60 text-xs">$PUMP swapped</div>
+                            <div className="font-semibold">
+                              {(p.pumpSwapped || 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
+                            </div>
+                          </div>
+                          {p?.txs?.swapSig ? (
+                            <a
+                              className="text-xs underline opacity-80"
+                              target="_blank"
+                              rel="noreferrer"
+                              href={`https://solscan.io/tx/${p.txs.swapSig}`}
+                            >
+                              Solscan
+                            </a>
+                          ) : (
+                            <span className="text-xs opacity-50">—</span>
+                          )}
+                        </div>
+
+                        {/* CSV download if present */}
+                        {p.csv ? (
+                          <div className="rounded-lg p-3 bg-[#0f0f14] border border-[#24242f] flex items-center justify-between">
+                            <div className="opacity-60 text-xs">Snapshot holders CSV</div>
+                            <a className="text-xs underline opacity-80" href={p.csv}>
+                              Download
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              </details>
+            </div>
+          </section>
+        )}
 
         {/* Feed */}
         {tab === "feed" && (
@@ -1075,6 +1174,90 @@ const submit = await fetch("/api/claim-submit", {
                 </button>
               </div>
             </motion.div>
+          </div>
+        )}
+
+        {/* === ADDED: How it works modal === */}
+        {showHow && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[9999]">
+            <div
+              className="rounded-2xl p-5 w-[min(720px,92vw)] max-h-[82vh] overflow-auto"
+              style={{ background: "var(--panel)", border: "1px solid #333" }}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="font-semibold text-lg">How it works</div>
+                <button
+                  onClick={() => setShowHow(false)}
+                  className="px-3 py-1 rounded-md"
+                  style={{ background: "#2a2a33" }}
+                >
+                  Close
+                </button>
+              </div>
+              <div className="space-y-3 text-sm leading-6 opacity-95 text-left">
+                <p className="leading-6">
+                  <b>PUMPDROP</b> is{" "}
+                  <span className="text-[var(--accent)] font-semibold animate-pulse">fully automated</span> — every 10
+                  minutes it automatically collects creator rewards, swaps to <b>$PUMP</b>, and fairly splits them to all
+                  eligible holders (&gt; 10,000 $PUMPDROP). No staking, no forms, no manual distribution — just connect
+                  and claim.
+                </p>
+                <ol className="list-decimal pl-5 space-y-2">
+                  <li>
+                    <b>Cycle basics.</b> A new drop happens every {CYCLE_MINUTES} minutes. The countdown bar shows the
+                    next distribution window.
+                  </li>
+
+                  <li>
+                    <b>Eligibility snapshot.</b> Moments before the timer ends (about {SNAPSHOT_OFFSET_SECONDS}s), we
+                    snapshot holders of <b>&gt; 10,000 $PUMPDROP</b>. AMM/LP and any blacklisted addresses are
+                    excluded to keep it fair.
+                    <ul className="mt-1 list-disc pl-5 space-y-1 opacity-80">
+                      <li>Your wallet balance at snapshot time determines eligibility for that cycle.</li>
+                      <li>No staking or LP position required—just hold the tokens in your wallet.</li>
+                    </ul>
+                  </li>
+
+                  <li>
+                    <b>Allocation math.</b> The $PUMP collected for the cycle is split evenly across all eligible
+                    wallets. Your “Claimable now” card shows the exact amount available to you.
+                  </li>
+
+                  <li>
+                    <b>Claiming.</b> Connect your wallet and press <b>CLAIM $PUMP</b>. You’ll sign a single transaction
+                    and receive tokens instantly.
+                    <ul className="mt-1 list-disc pl-5 space-y-1 opacity-80">
+                      <li>If your $PUMP token account (ATA) doesn’t exist, the transaction creates it automatically.</li>
+                      <li>Standard Solana fees apply.</li>
+                    </ul>
+                  </li>
+
+                  <li>
+                    <b>Unclaimed rollovers.</b> If you miss a cycle, your allocation stays available. Each new cycle
+                    only uses fresh $PUMP—previous entitlements remain claimable.
+                  </li>
+
+                  <li>
+                    <b>Proof &amp; transparency.</b> The <b>POW</b> tab publishes the snapshot ID, hash, and on-chain
+                    transactions (with Solscan links) for creator rewards, swaps, and distributions.
+                  </li>
+
+                  <li>
+                    <b>Your history.</b> Connect your wallet to see a private <b>My History</b> list of your claims.
+                  </li>
+
+                  <li className="leading-6">
+                    <b className="text-red-500 animate-pulse">Safety.</b> We never ask for approvals or spending
+                    permissions—just a one-time claim transaction signed by you.{" "}
+                    <span className="text-red-500 font-semibold">Always verify details before signing.</span>
+                  </li>
+                </ol>
+
+                <div className="text-xs opacity-50">
+                  <p>*10% of creator rewards are allocated to the development team.</p>
+                </div>
+              </div>
+            </div>
           </div>
         )}
       </main>
@@ -1292,5 +1475,3 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
-
-
