@@ -389,22 +389,25 @@ function InnerApp() {
         return;
       }
 
-      // Sign locally
-      const unsignedTx = VersionedTransaction.deserialize(b64ToU8a(txB64));
-      const userSigned = await signTransaction(unsignedTx);
-      const signedTxB64 = u8aToB64(userSigned.serialize());
+      // --- Phantom signs FIRST ---
+const unsignedTx = VersionedTransaction.deserialize(b64ToU8a(txB64));
+const userSigned = await signTransaction(unsignedTx);
+const signedTxB64 = u8aToB64(userSigned.serialize());
 
-      // Submit to server for co-sign + broadcast
-      const submit = await fetch("/api/claim-submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          wallet: publicKey.toBase58(),
-          signedTxB64,
-          snapshotIds: snapIds,
-          amount: amountToClaim,
-        }),
-      }).then((r) => r.json());
+// Send to server for additional signer + broadcast
+const submit = await fetch("/api/claim-submit", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    wallet: publicKey.toBase58(),
+    signedTxB64,
+    unsignedTxB64: txB64,   // ← add this line
+    snapshotIds: snapIds,
+    amount: amountToClaim,
+  }),
+}).then(r => r.json());
+
+
 
       if (!submit?.ok || !submit?.sig) throw new Error(submit?.error || "submit failed");
       const sig = submit.sig as string;
@@ -1292,3 +1295,4 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
