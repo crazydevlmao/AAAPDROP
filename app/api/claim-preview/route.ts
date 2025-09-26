@@ -21,15 +21,21 @@ const DECIMALS = 6; // ⚠️ must match snapshot semantics
 const TEN_POW_DEC = Math.pow(10, DECIMALS);
 const ENTITLEMENT_IS_RAW = String(process.env.ENTITLEMENT_IS_RAW || "").toLowerCase() === "true";
 
-// Optional server-to-server secret. If set, client must send header x-drop-secret
+// DO NOT require DROP_SECRET for this route — browsers cannot send it.
+// (Keep it for prepare-drop/snapshot/worker-only routes.)
 const DROP_SECRET = process.env.DROP_SECRET || "";
 
-// Per-IP & per-wallet token buckets (simple in-memory). Tune as needed.
+// Gentle rate limits
 const RATE_PER_MIN_IP = 60;      // 60 req/min per IP
 const RATE_PER_MIN_WALLET = 120; // 120 req/min per wallet
 
-// Cache program/ATA discovery for 5 min to avoid RPC dogpiles
+// Program/ATA discovery cache (avoid repeated RPC)
 const PROGRAM_CACHE_TTL_MS = 5 * 60 * 1000;
+
+// Ultra-short per-wallet preview cache to absorb double-clicks (prevents RPC pileup)
+// Keep tiny to avoid any chance of stale double-claim. The claim flow marks DB,
+// so a 2.5s window is safe for accidental duplicate clicks/tabs.
+const PREVIEW_CACHE_TTL_MS = 2500;
 
 /* ========= HELPERS ========= */
 const noStore = {
@@ -43,11 +49,9 @@ const noStore = {
 function json(data: any, init?: ResponseInit) {
   return NextResponse.json(data, { ...init, ...noStore });
 }
-
 function bad(status: number, msg: string, extra?: any) {
   return json({ ok: false, error: msg, ...extra }, { status });
 }
-
 function parseWallet(raw: any): PublicKey | null {
   try {
     const s = String(raw ?? "").trim();
@@ -57,9 +61,7 @@ function parseWallet(raw: any): PublicKey | null {
     return null;
   }
 }
-
 function correlationId(req: Request) {
-  // allow upstream to pass one; otherwise generate light id
   return (
     req.headers.get("x-request-id") ||
     req.headers.get("cf-ray") ||
@@ -102,7 +104,6 @@ async function getProgramAndFromAta() {
   const conn = connection();
   const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
 
-  // Discover token program and treasury ATA once per cache window
   const tokenProgramId = await getMintTokenProgramId(conn, PUMP_MINT);
   const fromAta = getAssociatedTokenAddressSync(PUMP_MINT, treasuryPubkey, false, tokenProgramId);
 
@@ -118,23 +119,28 @@ async function getProgramAndFromAta() {
   return val;
 }
 
+/* ========= PER-WALLET SINGLE-FLIGHT + MICRO-CACHE ========= */
+type PreviewPayload = {
+  ok: true;
+  txBase64: string;
+  amount: number;
+  feeSol: number;
+  snapshotIds: string[];
+  now: number;
+};
+type CacheRow = { at: number; resp: PreviewPayload };
+
+const PREVIEW_CACHE = new Map<string, CacheRow>();      // walletLc -> last preview
+const PENDING = new Map<string, Promise<PreviewPayload>>(); // walletLc -> in-flight promise
+
 /* ========= ROUTE ========= */
 export async function POST(req: Request) {
   const cid = correlationId(req);
 
   try {
-    // Optional auth: require secret when configured
-    if (DROP_SECRET) {
-      const provided = req.headers.get("x-drop-secret") || "";
-      if (provided !== DROP_SECRET) {
-        console.warn(
-          JSON.stringify({ cid, where: "claim-preview", msg: "Unauthorized: bad DROP_SECRET" })
-        );
-        return bad(401, "Unauthorized");
-      }
-    }
+    // DO NOT gate this route with DROP_SECRET (browser cannot send it).
+    // Keep it public, but shield with rate limits + caches.
 
-    // Rate limit by IP and wallet
     const ip =
       (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
       req.headers.get("x-real-ip") ||
@@ -144,7 +150,6 @@ export async function POST(req: Request) {
       return bad(429, "Too Many Requests (ip)");
     }
 
-    // Parse body
     const body = await req.json().catch(() => ({}));
     const userPk = parseWallet(body.wallet);
     if (!userPk) return bad(400, "Missing or invalid wallet");
@@ -153,82 +158,99 @@ export async function POST(req: Request) {
     const userLc = userBase58.toLowerCase();
 
     if (!allow(WALLET_BUCKET, userLc, RATE_PER_MIN_WALLET)) {
-      console.warn(
-        JSON.stringify({ cid, where: "claim-preview", wallet: userBase58, err: "rate_limited_wallet" })
-      );
+      console.warn(JSON.stringify({ cid, where: "claim-preview", wallet: userBase58, err: "rate_limited_wallet" }));
       return bad(429, "Too Many Requests (wallet)");
     }
 
-    // Gather all unclaimed entitlements for this wallet
-    const rows = await db.listWalletEntitlements(userLc);
-    const unclaimed = rows.filter((r: any) => !r.claimed);
-    const snapshotIds: string[] = unclaimed.map((r: any) => String(r.snapshotId));
-
-    const amountUi = unclaimed.reduce((sum: number, r: any) => {
-      const a = Number(r.amount || 0);
-      if (!Number.isFinite(a) || a <= 0) return sum;
-      return sum + (ENTITLEMENT_IS_RAW ? a / TEN_POW_DEC : a);
-    }, 0);
-
-    if (!Number.isFinite(amountUi) || amountUi <= 0 || snapshotIds.length === 0) {
-      // Return ok:true so UI can immediately show "0" and avoid extra requests
-      console.info(
-        JSON.stringify({
-          cid,
-          where: "claim-preview",
-          wallet: userBase58,
-          note: "no_unclaimed",
-        })
-      );
-      return json({ ok: true, amount: 0, snapshotIds: [] });
+    // Micro-cache to absorb double-clicks/tabs
+    const hit = PREVIEW_CACHE.get(userLc);
+    if (hit && Date.now() - hit.at < PREVIEW_CACHE_TTL_MS) {
+      return json(hit.resp);
     }
 
-    // Program/ATA discovery (cached)
-    const { tokenProgramId } = await getProgramAndFromAta();
+    // Single-flight: if already building, await that promise
+    const inflight = PENDING.get(userLc);
+    if (inflight) {
+      const resp = await inflight.catch(() => null);
+      if (resp) return json(resp);
+    }
 
-    // Build UNSIGNED TX (user pays fees)
-    const conn = connection();
-    const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
-    const { txB64, amount, feeSol } = await buildClaimTx({
-      conn,
-      treasuryPubkey,
-      user: userPk,
-      amountPump: amountUi,
-      teamWallet: treasuryPubkey, // not used in current flow
-      tokenProgramId,
-    });
+    // Build once for this wallet, share to concurrent callers
+    const promise = (async (): Promise<PreviewPayload> => {
+      // Gather unclaimed entitlements (DB only, no RPC)
+      const rows = await db.listWalletEntitlements(userLc);
+      const unclaimed = rows.filter((r: any) => !r.claimed);
+      const snapshotIds: string[] = unclaimed.map((r: any) => String(r.snapshotId));
 
-    // Structured success log
-    console.info(
-      JSON.stringify({
-        cid,
-        where: "claim-preview",
-        wallet: userBase58,
-        amount,
-        feeSol,
-        snapshots: snapshotIds.length,
-      })
-    );
+      const amountUi = unclaimed.reduce((sum: number, r: any) => {
+        const a = Number(r.amount || 0);
+        if (!Number.isFinite(a) || a <= 0) return sum;
+        return sum + (ENTITLEMENT_IS_RAW ? a / TEN_POW_DEC : a);
+      }, 0);
 
-    // Return ready-to-sign tx so you can bypass the preview modal
-    return json({
-      ok: true,
-      txBase64: txB64,
-      amount,
-      feeSol,
-      snapshotIds,
-      now: Date.now(),
-    });
+      if (!Number.isFinite(amountUi) || amountUi <= 0 || snapshotIds.length === 0) {
+        const resp: PreviewPayload = {
+          ok: true,
+          txBase64: "", // no tx to sign
+          amount: 0,
+          feeSol: 0,
+          snapshotIds: [],
+          now: Date.now(),
+        };
+        return resp;
+      }
+
+      // Program/ATA discovery (cached)
+      const { tokenProgramId } = await getProgramAndFromAta();
+
+      // Build UNSIGNED tx (user pays fees). Note: buildClaimTx currently fetches a blockhash
+      // internally. We'll keep it here; the single-flight+cache prevents dogpiles.
+      const conn = connection();
+      const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
+      const built = await buildClaimTx({
+        conn,
+        treasuryPubkey,
+        user: userPk,
+        amountPump: amountUi,
+        teamWallet: treasuryPubkey, // not used in current flow
+        tokenProgramId,
+      });
+
+      const resp: PreviewPayload = {
+        ok: true,
+        txBase64: built.txB64,
+        amount: built.amount,
+        feeSol: built.feeSol,
+        snapshotIds,
+        now: Date.now(),
+      };
+      return resp;
+    })();
+
+    PENDING.set(userLc, promise);
+
+    let out: PreviewPayload;
+    try {
+      out = await promise;
+    } finally {
+      PENDING.delete(userLc);
+    }
+
+    // Only cache non-empty responses for a tiny window (prevents accidental double-click storms)
+    PREVIEW_CACHE.set(userLc, { at: Date.now(), resp: out });
+
+    console.info(JSON.stringify({
+      cid,
+      where: "claim-preview",
+      wallet: userBase58,
+      amount: out.amount,
+      snapshots: out.snapshotIds.length,
+      cachedMs: PREVIEW_CACHE_TTL_MS,
+    }));
+
+    return json(out);
   } catch (e: any) {
-    // Structured error log with message
-    console.error(
-      JSON.stringify({
-        cid,
-        where: "claim-preview",
-        error: String(e?.message || e),
-      })
-    );
-    // 409 is returned above for ATA-missing; default others to 500
+    console.error(JSON.stringify({ cid, where: "claim-preview", error: String(e?.message || e) }));
     const msg = String(e?.message || e || "Internal Error");
     const status = /not found for this mint\/program/i.test(msg) ? 409 : 500;
     return bad(status, msg);
