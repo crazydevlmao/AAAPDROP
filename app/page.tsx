@@ -831,6 +831,26 @@ useEffect(() => {
           <button onClick={() => setTab("proofs")} className={`px-3 py-1.5 rounded-lg text-xs ${tab === "proofs" ? "bg-[#222]" : "bg-[#17171d] border border-[#24242f]"}`}>POW</button>
           <button onClick={() => setTab("feed")} className={`px-3 py-1.5 rounded-lg text-xs ${tab === "feed" ? "bg-[#222]" : "bg-[#17171d] border border-[#24242f]"}`}>Feed</button>
           <button onClick={() => setTab("history")} className={`px-3 py-1.5 rounded-lg text-xs ${tab === "history" ? "bg-[#222]" : "bg-[#17171d] border border-[#24242f]"}`}>My History</button>
+          <button onClick={() => setTab("history")} className={`px-3 py-1.5 rounded-lg text-xs ${tab === "history" ? "bg-[#222]" : "bg-[#17171d] border border-[#24242f]"}`}>My History</button>
+
+{/* —— New: disabled Stake (with “Coming soon”) —— */}
+<div className="relative">
+  <button
+    type="button"
+    disabled
+    title="Staking launches soon"
+    className="px-3 py-1.5 rounded-lg text-xs bg-[#15151b] border border-[#24242f] text-neutral-400 cursor-not-allowed"
+  >
+    Stake
+  </button>
+  <span
+    className="wiggle-2s absolute -top-2 -right-2 text-[10px] px-1.5 py-0.5 rounded-md bg-[#2a2a33] border border-[#34343f] text-neutral-300 shadow"
+    aria-hidden="true"
+  >
+    Coming&nbsp;soon
+  </span>
+</div>
+
         </div>
 
         {/* Holders */}
@@ -1354,6 +1374,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
