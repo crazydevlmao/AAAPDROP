@@ -616,15 +616,6 @@ useEffect(() => {
             How it works
           </button>
 
-          <button
-            onClick={handleClaim}
-            className={`px-4 py-2 rounded-xl text-sm ${connected ? "bg-[var(--accent)] text-black hover:brightness-95" : "bg-[#111118] border border-[#2a2a33] opacity-80"}`}
-            disabled={!connected || claiming}
-            title={connected ? "Claim your $PUMP" : "Connect wallet first"}
-          >
-            {connected ? (claiming ? "Claiming…" : "CLAIM $PUMP") : "Connect Wallet"}
-          </button>
-
           {/* Wallets overlay */}
           <div className="absolute right-0 top-full mt-2 w-56 z-50">
             <WalletStrip />
@@ -1458,4 +1449,5 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
