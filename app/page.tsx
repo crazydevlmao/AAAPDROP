@@ -1229,6 +1229,8 @@ useEffect(() => {
 
                 <div className="text-xs opacity-50">
                   <p>*10% of creator rewards are allocated to the development team.</p>
+                  <p className="mt-1">*Each claim includes a 0.01 SOL fee to support app operations and future features.</p>
+                  <p className="mt-1">*The Pumpdrop program runs continuously, 24/7, powered by in-house smart contracts.</p>
                 </div>
               </div>
             </div>
@@ -1449,5 +1451,6 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
