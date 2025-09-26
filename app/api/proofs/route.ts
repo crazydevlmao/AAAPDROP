@@ -10,8 +10,9 @@ import { PublicKey, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 /* ===== Config ===== */
-const TTL_MS = 15_000;       // faster UI refresh
-const TX_TTL_MS = 5 * 60_000;
+const TTL_MS = 15_000;        // fast UI refresh post-boundary
+const TX_TTL_MS = 5 * 60_000; // per-tx parse cache
+
 const noStore = {
   headers: {
     "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -38,17 +39,26 @@ type ProofsPayload = {
   snapshotId: any;
   snapshotTs: any;
   snapshotHash: any;
-  pumpBalance: number;
-  deltaPump: number;
-  creatorSol: number;
-  pumpSwapped: number;
+  pumpBalance: number;  // equals deltaPump (UI units)
+  deltaPump: number;    // allocated this cycle (UI units)
+  creatorSol: number;   // SOL credited to DEV this cycle
+  pumpSwapped: number;  // PUMP bought into Treasury this cycle (UI units)
   txs: {
     claimSig: string | null;
     claimSolscan?: string;
     swapSig: string | null;
     swapSolscan?: string;
   };
-  previous: any[];
+  previous: Array<{
+    snapshotId: any;
+    snapshotTs: any;
+    snapshotHash: any;
+    deltaPump: number;
+    pumpBalance: number;
+    creatorSol: number;
+    pumpSwapped: number;
+    txs: { claimSig: string | null; swapSig: string | null };
+  }>;
 };
 let SNAP_CACHE: { at: number; key: string; data: ProofsPayload } | null = null;
 let PENDING: Promise<ProofsPayload> | null = null;
@@ -57,6 +67,7 @@ let PENDING: Promise<ProofsPayload> | null = null;
 type TxCacheEntry = { at: number; creatorSol?: number; pumpSwapped?: number; isCollect?: boolean };
 const TX_CACHE = new Map<string, TxCacheEntry>();
 
+/* ===== Utils ===== */
 function cidOf(req: Request) {
   return (
     req.headers.get("x-request-id") ||
@@ -66,7 +77,7 @@ function cidOf(req: Request) {
 }
 function n(v: any) { const x = Number(v); return Number.isFinite(x) ? x : 0; }
 
-/** Build the full account-keys array = static + lookups (writable + readonly). */
+/** Include ALT lookups so indices align with pre/post balances. */
 function allAccountKeys(msg: any): PublicKey[] {
   try {
     const ak = msg.getAccountKeys?.();
@@ -84,7 +95,7 @@ function allAccountKeys(msg: any): PublicKey[] {
   return Array.isArray(fallback) ? fallback : [];
 }
 
-/** Quick check: does this tx have the Pump log line? */
+/** Quick check: does this tx have the Pump log line? (prefer confirmed; fall back to finalized) */
 async function isCollectCreatorFee(sig: string): Promise<boolean> {
   const key = "isCollect:" + sig;
   const hit = TX_CACHE.get(key);
@@ -94,11 +105,10 @@ async function isCollectCreatorFee(sig: string): Promise<boolean> {
   }
   try {
     const conn = connection();
-    await conn.confirmTransaction(sig, "finalized");
-    const tx = await conn.getTransaction(sig, {
-      maxSupportedTransactionVersion: 0,
-      commitment: "finalized",
-    });
+    let tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+    if (!tx) {
+      tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "finalized" });
+    }
     const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
     const ok = logs.some((l) => l.toLowerCase().includes("collect_creator_fee"));
     TX_CACHE.set(key, { at: now, isCollect: ok });
@@ -109,6 +119,7 @@ async function isCollectCreatorFee(sig: string): Promise<boolean> {
   }
 }
 
+/** SOL credited to `target` (never negative). */
 async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<number> {
   const key = "creator:" + sig;
   const hit = TX_CACHE.get(key);
@@ -116,10 +127,10 @@ async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<numb
   if (hit && now - hit.at < TX_TTL_MS && typeof hit.creatorSol === "number") return Math.max(0, hit.creatorSol!);
 
   const conn = connection();
-  const tx = await conn.getTransaction(sig, {
-    maxSupportedTransactionVersion: 0,
-    commitment: "confirmed",
-  });
+  // prefer confirmed for freshness, fall back to finalized
+  let tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+  if (!tx) tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "finalized" });
+
   if (!tx?.meta) { TX_CACHE.set(key, { at: now, creatorSol: 0 }); return 0; }
 
   const keys: PublicKey[] = allAccountKeys(tx.transaction.message);
@@ -134,6 +145,7 @@ async function lamportsToSolFromTx(sig: string, target: PublicKey): Promise<numb
   return val;
 }
 
+/** Net PUMP change for `owner` in this tx (UI units). */
 async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
   const key = "pump:" + sig;
   const hit = TX_CACHE.get(key);
@@ -141,14 +153,13 @@ async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
   if (hit && now - hit.at < TX_TTL_MS && typeof hit.pumpSwapped === "number") return hit.pumpSwapped!;
 
   const conn = connection();
-  const tx = await conn.getTransaction(sig, {
-    maxSupportedTransactionVersion: 0,
-    commitment: "confirmed",
-  });
+  let tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+  if (!tx) tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "finalized" });
   if (!tx?.meta) { TX_CACHE.set(key, { at: now, pumpSwapped: 0 }); return 0; }
 
   const pre = tx.meta.preTokenBalances || [];
   const post = tx.meta.postTokenBalances || [];
+
   const mintStr = PUMP_MINT.toBase58();
   const ownerLc = owner.toBase58().toLowerCase();
 
@@ -161,8 +172,8 @@ async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
   let deltaRaw = 0;
   for (const q of post) {
     if (q.mint === mintStr && (q as any).owner?.toLowerCase() === ownerLc) {
-      const key2 = String(q.accountIndex);
-      const preAmt = preMap.get(key2) ?? 0;
+      const idx = String(q.accountIndex);
+      const preAmt = preMap.get(idx) ?? 0;
       const postAmt = Number(q.uiTokenAmount?.amount || 0);
       deltaRaw += (postAmt - preAmt);
     }
@@ -172,6 +183,7 @@ async function pumpDeltaFromTx(sig: string, owner: PublicKey): Promise<number> {
   return val;
 }
 
+/* ===== DB helpers ===== */
 async function readLatestSnapshot(db: any) {
   if (db?.snapshot?.findFirst) return db.snapshot.findFirst({ orderBy: { cycleId: "desc" } });
   if (db?.getLatestSnapshot) return db.getLatestSnapshot();
@@ -195,6 +207,7 @@ async function getPrep(db: any, cycleId: string) {
   if (db?.prep?.findFirst) return db.prep.findFirst({ where: { cycleId: String(cycleId) } });
   return null;
 }
+
 function resolveDevPub(): PublicKey {
   try { return pubkeyFromEnv("DEV_WALLET"); } catch {}
   const sec = process.env.DEV_WALLET_SECRET?.trim();
@@ -205,6 +218,7 @@ function resolveDevPub(): PublicKey {
   throw new Error("Missing DEV_WALLET or DEV_WALLET_SECRET");
 }
 
+/* ===== Enrichment ===== */
 async function enrichFromPrep(prep: any, treasury: PublicKey, devPub: PublicKey) {
   const claimSig: string | null = prep?.claimSig ?? null;
   const swapSig: string | null =
@@ -224,12 +238,15 @@ async function enrichFromPrep(prep: any, treasury: PublicKey, devPub: PublicKey)
     creatorSol,
     pumpSwapped,
     txs: {
-      claimSig: claimOk && creatorSol > 0 ? claimSig : null,    // hide bogus link when no SOL
+      // Show claim link only if the tx is truly a collect_creator_fee AND value > 0
+      claimSig: claimOk && creatorSol > 0 ? claimSig : null,
+      // Show swap link if we have a signature (even if parsed delta is 0 due to route mechanics)
       swapSig: swapSig || null,
     },
   };
 }
 
+/* ===== Core ===== */
 async function computeProofs(): Promise<ProofsPayload> {
   const { db } = await import("@/lib/db");
   const treasury = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
@@ -256,14 +273,18 @@ async function computeProofs(): Promise<ProofsPayload> {
 
   // latest prep
   const prepNow: any = await getPrep(db, snap?.cycleId || "");
-  const latest = prepNow ? await enrichFromPrep(prepNow, treasury, devPub) : { creatorSol: 0, pumpSwapped: 0, txs: { claimSig: null, swapSig: null } };
+  const latest = prepNow
+    ? await enrichFromPrep(prepNow, treasury, devPub)
+    : { creatorSol: 0, pumpSwapped: 0, txs: { claimSig: null, swapSig: null } };
 
-  // previous snapshots → enrich each via its prep
-  const prevRows = await readPreviousSnapshots(db, 5);
+  // previous snapshots → enrich via their prep
+  const prevRows = await readPreviousSnapshots(db, 6);
   const previous = [];
   for (const p of prevRows) {
     const pr = await getPrep(db, p?.cycleId || "");
-    const enriched = pr ? await enrichFromPrep(pr, treasury, devPub) : { creatorSol: 0, pumpSwapped: 0, txs: { claimSig: null, swapSig: null } };
+    const enriched = pr
+      ? await enrichFromPrep(pr, treasury, devPub)
+      : { creatorSol: 0, pumpSwapped: 0, txs: { claimSig: null, swapSig: null } };
     previous.push({
       snapshotId: p.snapshotId,
       snapshotTs: p.snapshotTs,
@@ -294,9 +315,11 @@ async function computeProofs(): Promise<ProofsPayload> {
   };
 }
 
+/* ===== Route ===== */
 export async function GET(req: Request) {
   const cid = cidOf(req);
 
+  // Per-IP throttle: 60/min
   const ip =
     (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
     req.headers.get("x-real-ip") ||
