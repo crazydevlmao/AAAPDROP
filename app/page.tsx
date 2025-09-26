@@ -246,12 +246,20 @@ function InnerApp() {
 
   /* Recent claims feed */
   const [recent, setRecent] = useState<RecentClaim[]>([]);
-  async function refreshRecent() {
-    try {
-      const r = await fetch("/api/recent-claims", { cache: "no-store" }).then(r => r.json());
-      setRecent(Array.isArray(r) ? r.slice(0, 50) : []);
-    } catch {}
-  }
+ async function refreshRecent() {
+  try {
+    const r = await fetch("/api/recent-claims", { cache: "no-store" }).then(r => r.json());
+    const arr = Array.isArray(r) ? r.slice(0, 50) : [];
+    const seen = new Set<string>();
+    const deduped: RecentClaim[] = [];
+    for (const x of arr) {
+      const k = x?.sig || `${x?.wallet}-${x?.ts}`;
+      if (!seen.has(k)) { seen.add(k); deduped.push(x); }
+    }
+    setRecent(deduped);
+  } catch {}
+}
+
   useEffect(() => { refreshRecent(); }, []);
 
   // 🔁 Poll recent claims every 5 seconds so everyone sees updates
@@ -465,10 +473,19 @@ function InnerApp() {
       const sig = submit.sig as string;
 
       // Optimistically prepend claim to the feed (instant)
-      setRecent(prev => ([
-        { wallet: publicKey.toBase58(), amount: amountToClaim, ts: new Date().toISOString(), sig },
-        ...prev
-      ].slice(0, 50)));
+      setRecent(prev => {
+  const k = sig;
+  if (prev.some(p => p.sig === k)) return prev;
+  const next = [{ wallet: publicKey.toBase58(), amount: amountToClaim, ts: new Date().toISOString(), sig }, ...prev];
+  const seen = new Set<string>();
+  const unique: RecentClaim[] = [];
+  for (const x of next) {
+    const kk = x.sig || `${x.wallet}-${x.ts}`;
+    if (!seen.has(kk)) { seen.add(kk); unique.push(x); }
+  }
+  return unique.slice(0, 50);
+});
+
 
       // Optimistically bump Total Distributed
       setTotalDistributedPump(prev => prev + amountToClaim);
@@ -533,10 +550,22 @@ function InnerApp() {
           const amt = typeof retry?.amount === "number" ? retry.amount : (preview?.amount ?? 0);
 
           // Optimistic insert for retry path
-          setRecent(prev => ([
-            { wallet: publicKey!.toBase58(), amount: amt, ts: new Date().toISOString(), sig: sig2 },
-            ...prev
-          ].slice(0, 50)));
+          setRecent(prev => {
+  const k = sig2;
+  if (prev.some(p => p.sig === k)) return prev; // already present
+  const next = [
+    { wallet: publicKey!.toBase58(), amount: amt, ts: new Date().toISOString(), sig: sig2 },
+    ...prev,
+  ];
+  const seen = new Set<string>();
+  const unique: RecentClaim[] = [];
+  for (const x of next) {
+    const kk = x.sig || `${x.wallet}-${x.ts}`;
+    if (!seen.has(kk)) { seen.add(kk); unique.push(x); }
+  }
+  return unique.slice(0, 50);
+});
+
 
           setTotalDistributedPump(prev => prev + amt);
 
@@ -1331,3 +1360,4 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
