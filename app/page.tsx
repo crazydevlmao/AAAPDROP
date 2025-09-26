@@ -501,43 +501,68 @@ function InnerApp() {
 /* === ADDED: Client-side gentle triggers near end of cycle (+ green popup) === */
 const didPrepareRef = useRef(false);
 const didPreSnapshotRef = useRef(false);
+const didZeroRef = useRef(false);
+
 
 useEffect(() => {
   const secLeft = Math.floor(msLeft / 1000);
 
-  // T-120s (prep)
-  if (
-    !didPrepareRef.current &&
-    secLeft <= PREP_OFFSET_SECONDS &&
-    secLeft > PREP_OFFSET_SECONDS - 2
-  ) {
-    didPrepareRef.current = true;
-    fetch("/api/prepare-drop", { method: "POST" }).catch(() => {});
-  }
+// T-120s: warm caches (no secret routes). Keeps site “alive” and POW fresh.
+if (
+  !didPrepareRef.current &&
+  secLeft <= PREP_OFFSET_SECONDS &&
+  secLeft > PREP_OFFSET_SECONDS - 2
+) {
+  didPrepareRef.current = true;
 
-  // T-8s (snapshot) — fetch holders/proofs and show green toast
-  if (
-    !didPreSnapshotRef.current &&
-    secLeft <= SNAPSHOT_OFFSET_SECONDS &&
-    secLeft > SNAPSHOT_OFFSET_SECONDS - 2
-  ) {
-    didPreSnapshotRef.current = true;
-    (async () => {
-      try {
-        const url = new URL("/api/snapshot", window.location.origin);
-        url.searchParams.set("mint", COIN_MINT);
-        url.searchParams.set("min", "10000");
-        url.searchParams.set("blacklist", Array.from(blacklistSet).join(","));
-        const data = await fetch(url.toString(), { cache: "no-store" }).then((r) => r.json());
-        if (Array.isArray(data?.holders)) setHolders(data.holders);
-        if (data?.pumpBalance) setPumpBalance(Number(data.pumpBalance) || 0);
-        if (data?.snapshotTs) setSnapshotTs(data.snapshotTs);
-        if (data?.snapshotId) setSnapshotId(data.snapshotId);
-      } catch {}
-      await Promise.allSettled([refreshMetrics(), refreshRecent(), refreshProofs()]);
-      showToast("New drop is ready — claim your $PUMP!", "success");
-    })();
+  // Light warm-ups for POW + metrics + recent feed
+  Promise.allSettled([refreshProofs(), refreshMetrics(), refreshRecent()]).catch(() => {});
+
+  // Sometimes also refresh holders (~35%) to avoid spam but keep it lively
+  if (Math.random() < 0.35) {
+    fetch("/api/holders", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((j) => Array.isArray(j?.holders) && setHolders(j.holders))
+      .catch(() => {});
   }
+}
+
+// T-8s: pre-snapshot refresh (no secret routes). Nudge UI right before drop.
+if (
+  !didPreSnapshotRef.current &&
+  secLeft <= SNAPSHOT_OFFSET_SECONDS &&
+  secLeft > SNAPSHOT_OFFSET_SECONDS - 2
+) {
+  didPreSnapshotRef.current = true;
+  (async () => {
+    await Promise.allSettled([refreshProofs(), refreshMetrics(), refreshRecent()]);
+    try {
+      const j = await fetch("/api/holders", { cache: "no-store" }).then((r) => r.json());
+      if (Array.isArray(j?.holders)) setHolders(j.holders);
+    } catch {}
+    showToast("New drop is ready — claim your $PUMP!", "success");
+  })();
+}
+
+// T-0: final refresh at boundary (belt & suspenders)
+if (!didZeroRef.current && secLeft <= 1) {
+  didZeroRef.current = true;
+  (async () => {
+    await Promise.allSettled([refreshProofs(), refreshMetrics(), refreshRecent()]);
+    try {
+      const j = await fetch("/api/holders", { cache: "no-store" }).then((r) => r.json());
+      if (Array.isArray(j?.holders)) setHolders(j.holders);
+    } catch {}
+  })();
+}
+
+// Reset flags right after boundary
+if (secLeft <= 0) {
+  didPrepareRef.current = false;
+  didPreSnapshotRef.current = false;
+  didZeroRef.current = false;
+}
+
 
   // Reset flags right after boundary
   if (secLeft <= 0) {
@@ -1451,6 +1476,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
