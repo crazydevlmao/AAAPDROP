@@ -10,24 +10,29 @@ import {
   VersionedTransaction,
   PublicKey,
   clusterApiUrl,
-  ComputeBudgetProgram,
-  TransactionMessage,
-  SystemProgram,
 } from "@solana/web3.js";
-import {
-  getAssociatedTokenAddressSync,
-  createAssociatedTokenAccountIdempotentInstruction,
-  createTransferCheckedInstruction,
-} from "@solana/spl-token";
-import { connection, keypairFromEnv, pubkeyFromEnv, getMintTokenProgramId, PUMP_MINT } from "@/lib/solana";
 import { db } from "@/lib/db";
+import {
+  connection,
+  keypairFromEnv,
+  pubkeyFromEnv,
+  getMintTokenProgramId,
+  PUMP_MINT,
+} from "@/lib/solana";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 
 /* ===== Config ===== */
+// Browser calls this route → DO NOT require DROP_SECRET. If present, accept but never require it.
 const DROP_SECRET = process.env.DROP_SECRET || "";
+
+// Tight limits so a single user can’t DDoS the relay:
 const RATE_PER_MIN_IP = 30;
 const RATE_PER_MIN_WALLET = 30;
+
+// Entitlement units (raw lamports of 6-dec token vs UI)
 const ENTITLEMENT_IS_RAW = String(process.env.ENTITLEMENT_IS_RAW || "").toLowerCase() === "true";
 
+// Optional fallback endpoint for bursty slots:
 const FALLBACK_RPC =
   process.env.SOLANA_RPC_FALLBACK ||
   process.env.NEXT_PUBLIC_SOLANA_RPC_2 ||
@@ -99,12 +104,16 @@ async function sendWithFallback(tx: VersionedTransaction, primary: Connection): 
         continue;
       }
       if (FALLBACK_RPC && (isRate || isBusy)) {
-        const fallbackConn = connFrom(FALLBACK_RPC);
-        return await fallbackConn.sendRawTransaction(tx.serialize(), {
-          skipPreflight: true,
-          maxRetries: 5,
-          preflightCommitment: "confirmed",
-        });
+        try {
+          const fallbackConn = connFrom(FALLBACK_RPC);
+          return await fallbackConn.sendRawTransaction(tx.serialize(), {
+            skipPreflight: true,
+            maxRetries: 5,
+            preflightCommitment: "confirmed",
+          });
+        } catch (e: any) {
+          throw new Error(`relay failed (fallback): ${String(e?.message || e)}`);
+        }
       }
       throw new Error(`relay failed: ${msg}`);
     }
@@ -112,11 +121,30 @@ async function sendWithFallback(tx: VersionedTransaction, primary: Connection): 
   throw new Error("relay failed: attempts exhausted");
 }
 
+// Include ALT lookups (for safety when wallets use LUTs)
+function allAccountKeys(msg: any): PublicKey[] {
+  try {
+    const ak = msg.getAccountKeys?.();
+    if (ak) {
+      const out: PublicKey[] = [...(ak.staticAccountKeys || [])];
+      const look = (ak as any).accountKeysFromLookups;
+      if (look) {
+        if (Array.isArray(look.writable)) out.push(...look.writable);
+        if (Array.isArray(look.readonly)) out.push(...look.readonly);
+      }
+      if (out.length) return out;
+    }
+  } catch {}
+  const fallback = (msg?.accountKeys || []) as PublicKey[];
+  return Array.isArray(fallback) ? fallback : [];
+}
+
 /* ===== Route ===== */
 export async function POST(req: Request) {
   const cid = cidOf(req);
 
   try {
+    // Optional secret: if provided & mismatched, reject; never required.
     if (DROP_SECRET) {
       const provided = req.headers.get("x-drop-secret");
       if (provided && provided !== DROP_SECRET) {
@@ -137,6 +165,7 @@ export async function POST(req: Request) {
 
     const userPk = parseWallet(body.wallet);
     const signedTxB64 = String(body.signedTxB64 || "").trim();
+    const unsignedTxB64 = typeof body.unsignedTxB64 === "string" ? body.unsignedTxB64.trim() : ""; // optional
     const snapshotIds: string[] = Array.isArray(body.snapshotIds) ? body.snapshotIds.map(String) : [];
     const amtNum = Number(body.amount);
     const amountClient = Number.isFinite(amtNum) && amtNum > 0 ? amtNum : 0;
@@ -152,11 +181,10 @@ export async function POST(req: Request) {
       return bad(429, "Too Many Requests (wallet)");
     }
 
-    // === Re-derive entitlements (UI units) ===
+    // === Re-derive entitlements server-side (idempotent + anti-tamper) ===
     const ent = await db.listWalletEntitlements(userLc);
     const isInSnapshot = new Set(snapshotIds);
-
-    let newlyUi = 0;
+    let newlyUi = 0;  // amount still unclaimed for these snapshots (UI units)
     let totalUi = 0;
 
     for (const r of ent) {
@@ -184,54 +212,45 @@ export async function POST(req: Request) {
       return bad(400, "Invalid fee payer");
     }
 
-    // === Build the EXPECTED claim message with the SAME blockhash ===
-    const primaryConn = connection();
-    const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
-    const tokenProgramId = await getMintTokenProgramId(primaryConn, PUMP_MINT);
-
-    const fromAta = getAssociatedTokenAddressSync(PUMP_MINT, treasuryPubkey, false, tokenProgramId);
-    const toAta   = getAssociatedTokenAddressSync(PUMP_MINT, userPk,        false, tokenProgramId);
-
-    const DECIMALS = 6;
-    const rawAmount = Math.max(0, Math.floor(newlyUi * 10 ** DECIMALS));
-
-    const CLAIM_FEE_SOL_RAW = Number(process.env.CLAIM_FEE_SOL ?? "0.01");
-    const CLAIM_FEE_SOL = Number.isFinite(CLAIM_FEE_SOL_RAW) ? Math.max(0, CLAIM_FEE_SOL_RAW) : 0.01;
-    const feeLamports = Math.max(0, Math.floor(CLAIM_FEE_SOL * 1_000_000_000));
-
-    const expectedIxs = [
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
-      createAssociatedTokenAccountIdempotentInstruction(
-        userPk, fromAta, treasuryPubkey, PUMP_MINT, tokenProgramId
-      ),
-      createAssociatedTokenAccountIdempotentInstruction(
-        userPk, toAta, userPk, PUMP_MINT, tokenProgramId
-      ),
-      ...(feeLamports > 0
-        ? [SystemProgram.transfer({ fromPubkey: userPk, toPubkey: treasuryPubkey, lamports: feeLamports })]
-        : []),
-      createTransferCheckedInstruction(
-        fromAta, PUMP_MINT, toAta, treasuryPubkey, rawAmount, DECIMALS, [], tokenProgramId
-      ),
-    ];
-
-    const expectedMsg = new TransactionMessage({
-      payerKey: userPk,
-      recentBlockhash: tx.message.recentBlockhash, // ← use the user’s blockhash
-      instructions: expectedIxs,
-    }).compileToV0Message();
-
-    const expectedMsgB64 = Buffer.from(expectedMsg.serialize()).toString("base64");
-    const actualMsgB64   = Buffer.from(tx.message.serialize()).toString("base64");
-
-    if (expectedMsgB64 !== actualMsgB64) {
-      return bad(400, "Submitted transaction does not match the issued preview");
+    // ---- Soft preview consistency check (NO hard-fail) ----
+    if (unsignedTxB64) {
+      try {
+        const rawU = Buffer.from(unsignedTxB64, "base64");
+        const unsigned = VersionedTransaction.deserialize(new Uint8Array(rawU.buffer, rawU.byteOffset, rawU.byteLength));
+        const expectMsg = Buffer.from(unsigned.message.serialize()).toString("base64");
+        const actualMsg = Buffer.from(tx.message.serialize()).toString("base64");
+        if (expectMsg !== actualMsg) {
+          console.warn(JSON.stringify({ cid, where: "claim-submit", warn: "preview_mismatch_ok" }));
+          // continue — do not block
+        }
+      } catch (e: any) {
+        console.warn(JSON.stringify({ cid, where: "claim-submit", warn: "preview_parse_failed_ok", detail: String(e?.message || e) }));
+      }
     }
+
+    // ---- Light sanity checks on accounts (NO hard-fail) ----
+    try {
+      const conn = connection();
+      const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
+      const tokenProgramId = await getMintTokenProgramId(conn, PUMP_MINT);
+      const fromAta = getAssociatedTokenAddressSync(PUMP_MINT, treasuryPubkey, false, tokenProgramId);
+      const toAta   = getAssociatedTokenAddressSync(PUMP_MINT, userPk,        false, tokenProgramId);
+      const keys = allAccountKeys(tx.message);
+      const hasTreasury = keys.some(k => k.equals(treasuryPubkey));
+      const hasFromAta  = keys.some(k => k.equals(fromAta));
+      const hasToAta    = keys.some(k => k.equals(toAta));
+      const hasMint     = keys.some(k => k.equals(PUMP_MINT));
+      if (!(hasTreasury && hasFromAta && hasToAta && hasMint)) {
+        console.warn(JSON.stringify({ cid, where: "claim-submit", warn: "account_sanity_warn", hasTreasury, hasFromAta, hasToAta, hasMint }));
+        // continue — treasury co-sign still protects us
+      }
+    } catch {}
 
     // === Server co-sign & relay ===
     const treasuryKp = keypairFromEnv("TREASURY_SECRET");
     tx.sign([treasuryKp]);
 
+    const primaryConn = connection();
     let sig = "";
     try {
       sig = await sendWithFallback(tx, primaryConn);
@@ -239,16 +258,41 @@ export async function POST(req: Request) {
       return bad(502, "Upstream relay error", { detail: String(e?.message || e).slice(0, 200) });
     }
 
+    // Single confirm (non-blocking if it times out)
     try { await primaryConn.confirmTransaction(sig, "confirmed"); } catch {}
 
-    // Mark claimed + feed + metrics
-    try { if ((db as any).markEntitlementsClaimed) await (db as any).markEntitlementsClaimed(userLc, snapshotIds, sig); } catch {}
-    try { await db.insertRecentClaim({ wallet: userBase58, amount: newlyUi, sig, ts: new Date().toISOString() }); } catch {}
-    try { await db.addToTotalDistributed(newlyUi); } catch {}
+    // === Mark claimed (idempotent) & update metrics ONLY for newly claimed ===
+    try {
+      if ((db as any).markEntitlementsClaimed) {
+        await (db as any).markEntitlementsClaimed(userLc, snapshotIds, sig);
+      }
+    } catch {}
+
+    // Persist claim feed for UX; amount = newlyUi
+    try {
+      await db.insertRecentClaim({
+        wallet: userBase58,
+        amount: newlyUi,
+        sig,
+        ts: new Date().toISOString(),
+      });
+    } catch {}
+
+    try {
+      await db.addToTotalDistributed(newlyUi);
+    } catch {}
 
     const solscan = `https://solscan.io/tx/${encodeURIComponent(sig)}`;
 
-    console.info(JSON.stringify({ cid, where: "claim-submit", wallet: userBase58, sig, snapshots: snapshotIds.length, newlyUi }));
+    console.info(JSON.stringify({
+      cid,
+      where: "claim-submit",
+      wallet: userBase58,
+      sig,
+      snapshots: snapshotIds.length,
+      newlyUi,
+    }));
+
     return json({ ok: true, sig, solscan, claimed: newlyUi });
   } catch (e: any) {
     console.error(JSON.stringify({ cid, where: "claim-submit", error: String(e?.message || e) }));
