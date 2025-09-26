@@ -10,8 +10,8 @@ import { PublicKey, Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 
 /* ===== Config ===== */
-const TTL_MS = 60_000;        // cache per latest snapshot (protects RPC)
-const TX_TTL_MS = 5 * 60_000; // cache per-tx parse (expensive RPC)
+const TTL_MS = 20_000;        // cache per latest snapshot (protects RPC)
+const TX_TTL_MS = 2 * 60_000; // cache per-tx parse (expensive RPC)
 const noStore = {
   headers: {
     "cache-control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -331,4 +331,5 @@ export async function GET(req: Request) {
     );
   }
 }
+
 
