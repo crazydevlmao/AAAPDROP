@@ -85,7 +85,7 @@ async function waitTreasuryIncrease(conn: Connection, treasury: PublicKey, preTr
   return await getSolBalance(conn, treasury);
 }
 
-/** Only accept a tx as "creator rewards" if logs contain `collect_creator_fee`. */
+/** Check logs for `collect_creator_fee` but don't make it a hard requirement. */
 async function isCollectCreatorFee(conn: Connection, sig: string): Promise<boolean> {
   try {
     await conn.confirmTransaction(sig, "finalized");
@@ -215,10 +215,10 @@ export async function POST(req: Request) {
         try { claimJson = await claimRes.json(); } catch {}
         let claimSig: string | null = claimJson?.signature || claimJson?.txSignature || null;
 
-        // verify the tx really is collect_creator_fee
+        // Try to verify logs; DO NOT discard the signature if check fails.
+        let claimSigVerified = false;
         if (claimSig) {
-          const ok = await isCollectCreatorFee(conn, claimSig);
-          if (!ok) claimSig = null; // do not store wrong tx
+          try { claimSigVerified = await isCollectCreatorFee(conn, claimSig); } catch {}
         }
 
         const { deltaSol } = await pollSolDelta(conn, DEV.publicKey, preSolDev);
@@ -230,7 +230,7 @@ export async function POST(req: Request) {
             pumpToTreasury: 0,
             pumpToTeam: 0,
             claimedSol: deltaSol,
-            claimSig: claimSig || undefined,
+            claimSig: claimSig || undefined, // keep the signature for proofs/solscan even if not verified
             status: "ok",
             ts: new Date().toISOString(),
             creatorSolDelta: 0,
@@ -319,7 +319,7 @@ export async function POST(req: Request) {
           acquiredPump: pumpBoughtUi,                // UI units
           pumpToTreasury: pumpBoughtUi,
           pumpToTeam: 0,
-          claimSig: claimSig || undefined,          // only if it’s really collect_creator_fee
+          claimSig: claimSig || undefined,          // keep signature even if logs couldn't prove it
           teamSig: teamSig || undefined,
           treasuryMoveSig: treasuryMoveSig || undefined,
           swapSigTreas: swapSigTreas || undefined,
@@ -342,7 +342,7 @@ export async function POST(req: Request) {
             step: "complete",
             cycleId: thisCycle,
             claimSig,
-            solscan, // <-- include Solscan link
+            solscan, // include Solscan link
             splits: {
               toTeamSolLamports: teamLamports,
               toTreasurySolLamports: adjustedTreasuryLamports,
