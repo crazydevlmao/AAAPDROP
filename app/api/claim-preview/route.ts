@@ -31,8 +31,8 @@ const PROGRAM_CACHE_TTL_MS = 5 * 60 * 1000;
 // Tiny cache to absorb double-clicks (keeps same previewId/msgHash)
 const PREVIEW_CACHE_TTL_MS = 2500;
 
-// Server will reject previews older than this on submit
-export const MAX_PREVIEW_AGE_MS = 120_000;
+// Server will reject previews older than this on submit (keep local; do NOT export)
+const MAX_PREVIEW_AGE_MS = 120_000;
 
 /* ========= HELPERS ========= */
 const noStore = {
@@ -122,10 +122,6 @@ async function savePreview(row: PreviewRow) {
   if ((db as any).savePreview) return (db as any).savePreview(row);
   MEM_PREVIEWS.set(row.previewId, row);
   MEM_LATEST_BY_WALLET.set(row.walletLc, row.previewId);
-}
-async function getPreviewById(previewId: string): Promise<PreviewRow | null> {
-  if ((db as any).getPreviewById) return (db as any).getPreviewById(previewId);
-  return MEM_PREVIEWS.get(previewId) || null;
 }
 async function getLatestPreviewForWallet(walletLc: string): Promise<PreviewRow | null> {
   if ((db as any).getLatestPreviewForWallet) return (db as any).getLatestPreviewForWallet(walletLc);
@@ -218,7 +214,7 @@ export async function POST(req: Request) {
 
     const previewId = randomUUID();
     const msgHash = msgHashFromTxB64(built.txB64);
-    const row: PreviewRow = {
+    await savePreview({
       previewId,
       walletLc: userLc,
       txB64: built.txB64,
@@ -226,8 +222,7 @@ export async function POST(req: Request) {
       snapshotIds,
       amount: built.amount,
       createdAt: Date.now(),
-    };
-    await savePreview(row);
+    });
 
     console.info(JSON.stringify({
       cid,
@@ -247,6 +242,7 @@ export async function POST(req: Request) {
       now: Date.now(),
       previewId,
       msgHash,
+      maxAgeMs: MAX_PREVIEW_AGE_MS,
     });
   } catch (e: any) {
     console.error(JSON.stringify({ cid: cidOf(req), where: "claim-preview", error: String(e?.message || e) }));
