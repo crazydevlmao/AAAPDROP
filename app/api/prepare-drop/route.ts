@@ -14,22 +14,22 @@ import {
   MessageV0,
 } from "@solana/web3.js";
 import bs58 from "bs58";
+import { promises as fsp } from "fs";
+import path from "path";
 import { db } from "@/lib/db";
 
-/* =================== Tunables (trimmed to avoid timeouts) =================== */
+/* =================== Tunables =================== */
 const TEAM_PCT = 0.10;              // 10% to TEAM
 const TREASURY_SOL_PCT = 0.85;      // 85% to TREASURY (rest stays on DEV as buffer)
 const SWAP_IN_TREASURY_PCT = 0.95;  // swap 95% of received SOL in Treasury
-
-// Keep API under ~10–12s so the worker doesn’t AbortError
-const POLL_TRIES_DELTA = 8;         // was 18
-const POLL_DELAY_MS = 700;          // was 900
-
-// Faster check for Treasury balance increase (don’t block long)
-const TREAS_POLL_TRIES = 6;         // was 18
-const TREAS_POLL_DELAY = 600;       // was 900
-
 const SLIPPAGES_BPS = [100, 200, 300];
+
+// Keep API under ~10–12s so worker won’t abort mid-call
+const POLL_TRIES_DELTA = 8;         // detect dev balance increase
+const POLL_DELAY_MS = 700;
+
+const TREAS_POLL_TRIES = 6;         // check treasury balance reflects incoming SOL
+const TREAS_POLL_DELAY = 600;
 
 const MIN_DEV_BUFFER_SOL =
   typeof process.env.MIN_DEV_BUFFER_SOL === "string"
@@ -37,6 +37,7 @@ const MIN_DEV_BUFFER_SOL =
     : 0.004;
 
 const PUMP_MINT = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn";
+const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 
 const noStore = { "cache-control": "no-store, no-cache, must-revalidate, max-age=0" };
 
@@ -103,7 +104,7 @@ async function isCollectCreatorFee(conn: Connection, sig: string): Promise<boole
 async function jupQuote(solUiAmount: number, slippageBps: number) {
   const inputMint = "So11111111111111111111111111111111111111112";
   const outputMint = PUMP_MINT;
-  const amountLamports = Math.floor(solUiAmount * LAMPORTS_PER_SOL); // integer
+  const amountLamports = Math.floor(solUiAmount * LAMPORTS_PER_SOL);
   if (amountLamports <= 0) throw new Error("Jupiter: zero amount");
   const url =
     `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}` +
@@ -160,6 +161,7 @@ function cycleIdNow(minutes = Number(process.env.CYCLE_MINUTES || 10)): string {
 
 /* =================== Route =================== */
 export async function POST(req: Request) {
+  let lockPath = "";
   try {
     requireSecret(req);
 
@@ -185,42 +187,88 @@ export async function POST(req: Request) {
     const conn = new Connection(pickRpc(), "confirmed");
     const thisCycle = cycleIdNow();
 
-    // ===== Idempotency guard (allow retry if swap didn't happen yet) =====
-    const existing = await db.getPrep(thisCycle);
-    if (existing) {
-      if (Number(existing.acquiredPump) > 0) {
-        return NextResponse.json(
-          { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
-          { headers: noStore }
-        );
-      }
-      // If we already moved SOL to Treasury and tried swap (or delta was zero), also stop
-      if (existing.swapSigTreas || existing.status === "swap_failed_or_dust" || existing.status === "ok") {
-        // We consider this cycle handled; snapshot will use existing.prep fields.
-        return NextResponse.json(
-          { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
-          { headers: noStore }
-        );
-      }
+    // ===== per-cycle lock to prevent double-sends =====
+    lockPath = path.join(DATA_DIR, `prep.lock.${thisCycle}`);
+    try {
+      await fsp.writeFile(lockPath, String(Date.now()), { flag: "wx" });
+    } catch {
+      const existing = await db.getPrep(thisCycle);
+      return NextResponse.json(
+        { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing || null },
+        { headers: noStore }
+      );
     }
 
-    /* 1) Collect creator rewards */
+    // ===== Check existing row to decide resume path =====
+    const existing = await db.getPrep(thisCycle);
+    if (existing?.acquiredPump && existing.acquiredPump > 0) {
+      return NextResponse.json(
+        { ok: true, step: "already-prepared", cycleId: thisCycle, prep: existing },
+        { headers: noStore }
+      );
+    }
+    if (existing && (existing.teamSig || existing.treasuryMoveSig) && !existing.swapSigTreas && existing.status !== "swap_failed_or_dust") {
+      // Resume from "post-split, pre-swap"
+      const toSwapUiExisting = Math.max(0, Number(existing.toSwapUi || 0));
+      let swapSigTreas: string | null = null;
+      let pumpBoughtUi = 0;
+
+      if (toSwapUiExisting > 0) {
+        let lastErr: any = null;
+        for (const s of SLIPPAGES_BPS) {
+          try {
+            const quote = await jupQuote(toSwapUiExisting, s);
+            try { pumpBoughtUi = Number(quote?.outAmount ?? 0) / 1e6; } catch {}
+            swapSigTreas = await jupSwap(conn, TREASURY_KP, quote);
+            break;
+          } catch (e) { lastErr = e; await sleep(500); }
+        }
+        if (!swapSigTreas) {
+          await db.upsertPrep({
+            ...existing,
+            status: "swap_failed_or_dust",
+            swapSigTreas: undefined,
+            swapSigs: [],
+            swapOutPumpUi: 0,
+            ts: new Date().toISOString(),
+          });
+          return NextResponse.json(
+            { ok: true, step: "treasury-swap-failed", cycleId: thisCycle, reason: String(lastErr) },
+            { headers: noStore }
+          );
+        }
+      }
+
+      const finalPump = pumpBoughtUi;
+      await db.upsertPrep({
+        ...existing,
+        acquiredPump: finalPump,
+        pumpToTreasury: finalPump,
+        pumpToTeam: 0,
+        swapSigTreas: swapSigTreas || undefined,
+        swapSigs: swapSigTreas ? [swapSigTreas] : [],
+        swapOutPumpUi: finalPump,
+        status: "ok",
+        ts: new Date().toISOString(),
+      });
+
+      return NextResponse.json(
+        { ok: true, step: "complete", cycleId: thisCycle, txs: { swapSigTreas } },
+        { headers: noStore }
+      );
+    }
+
+    /* 1) Collect creator rewards on DEV */
     const preSolDev = await getSolBalance(conn, DEV.publicKey);
     const claimRes = await fetch(`https://pumpportal.fun/api/trade?api-key=${API_KEY}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "collectCreatorFee", priorityFee: 0.000001, pool: "pump", mint: COIN_MINT }),
     });
-
     let claimJson: any = {};
     try { claimJson = await claimRes.json(); } catch {}
     let claimSig: string | null = claimJson?.signature || claimJson?.txSignature || null;
-
-    // verify it’s really collect_creator_fee
-    if (claimSig) {
-      const ok = await isCollectCreatorFee(conn, claimSig);
-      if (!ok) claimSig = null;
-    }
+    if (claimSig) { const ok = await isCollectCreatorFee(conn, claimSig); if (!ok) claimSig = null; }
 
     const { deltaSol } = await pollSolDelta(conn, DEV.publicKey, preSolDev);
 
@@ -245,7 +293,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, step: "claimed-zero", claimSig, deltaSol: 0 }, { headers: noStore });
     }
 
-    /* 2) Split SOL (don’t spend too long waiting) */
+    /* 2) Split SOL: DEV -> TEAM + TREASURY (single-shot, then persist mid-state) */
     const freshLamports = Math.floor(deltaSol * LAMPORTS_PER_SOL);
     const teamLamports = Math.floor(freshLamports * TEAM_PCT);
     const treasuryLamports = Math.floor(freshLamports * TREASURY_SOL_PCT);
@@ -267,17 +315,37 @@ export async function POST(req: Request) {
       treasuryMoveSig = await sendSol(conn, DEV, TREASURY_PUB, adjustedTreasuryLamports);
     }
 
-    // Try a short wait for Treasury balance to reflect; fall back to theoretical amount
+    // reflect or fallback
     let postTreasSol = preTreasSol;
     if (adjustedTreasuryLamports > 0) {
       postTreasSol = await waitTreasuryIncrease(conn, TREASURY_PUB, preTreasSol, adjustedTreasuryLamports / LAMPORTS_PER_SOL);
     }
-
-    /* 3) Swap in Treasury (retry slippages but don’t hang forever) */
     const receivedSol =
       postTreasSol - preTreasSol > 0 ? postTreasSol - preTreasSol : adjustedTreasuryLamports / LAMPORTS_PER_SOL;
     const toSwapUi = Math.max(0, receivedSol * SWAP_IN_TREASURY_PCT);
 
+    // ===== persist MID-STATE now (prevents double sends on retries) =====
+    await db.upsertPrep({
+      cycleId: thisCycle,
+      acquiredPump: 0,
+      pumpToTreasury: 0,
+      pumpToTeam: 0,
+      claimSig: claimSig || undefined,
+      teamSig: teamSig || undefined,
+      treasuryMoveSig: treasuryMoveSig || undefined,
+      swapSigTreas: undefined,
+      swapSigs: [],
+      splitSigs: [teamSig!, treasuryMoveSig!].filter(Boolean),
+      status: "ok",
+      ts: new Date().toISOString(),
+      creatorSolDelta: deltaSol,
+      toTeamSolLamports: teamLamports,
+      toTreasurySolLamports: adjustedTreasuryLamports,
+      toSwapUi,
+      swapOutPumpUi: 0,
+    });
+
+    /* 3) Swap in Treasury (short retries over slippages) */
     let swapSigTreas: string | null = null;
     let pumpBoughtUi = 0;
 
@@ -286,14 +354,10 @@ export async function POST(req: Request) {
       for (const s of SLIPPAGES_BPS) {
         try {
           const quote = await jupQuote(toSwapUi, s);
-          // Estimate outAmount from quote (UI units), guarded
           try { pumpBoughtUi = Number(quote?.outAmount ?? 0) / 1e6; } catch {}
-          swapSigTreas = await jupSwap(conn, TREASURY_KP!, quote);
+          swapSigTreas = await jupSwap(conn, TREASURY_KP, quote);
           break;
-        } catch (e) {
-          lastErr = e;
-          await sleep(500);
-        }
+        } catch (e) { lastErr = e; await sleep(500); }
       }
       if (!swapSigTreas) {
         await db.upsertPrep({
@@ -316,19 +380,19 @@ export async function POST(req: Request) {
           swapSigs: [],
         });
         return NextResponse.json(
-          { ok: true, step: "treasury-swap-failed", reason: String(lastErr) },
+          { ok: true, step: "treasury-swap-failed", cycleId: thisCycle, reason: String(lastErr) },
           { headers: noStore }
         );
       }
     }
 
-    // Persist prep for THIS cycle
+    // ===== Final persist for THIS cycle =====
     await db.upsertPrep({
       cycleId: thisCycle,
-      acquiredPump: pumpBoughtUi,                // UI units
+      acquiredPump: pumpBoughtUi,                // UI units (powers POW + snapshot allocation)
       pumpToTreasury: pumpBoughtUi,
       pumpToTeam: 0,
-      claimSig: claimSig || undefined,          // only if it’s really collect_creator_fee
+      claimSig: claimSig || undefined,
       teamSig: teamSig || undefined,
       treasuryMoveSig: treasuryMoveSig || undefined,
       swapSigTreas: swapSigTreas || undefined,
@@ -336,7 +400,7 @@ export async function POST(req: Request) {
       splitSigs: [teamSig!, treasuryMoveSig!].filter(Boolean),
       status: "ok",
       ts: new Date().toISOString(),
-      creatorSolDelta: deltaSol,                 // SOL delta in DEV
+      creatorSolDelta: deltaSol,                 // SOL delta in DEV (POW shows this)
       toTeamSolLamports: teamLamports,
       toTreasurySolLamports: adjustedTreasuryLamports,
       toSwapUi,
@@ -362,6 +426,11 @@ export async function POST(req: Request) {
   } catch (e: any) {
     console.error("prepare-drop error:", e);
     return NextResponse.json({ ok: false, error: String(e?.message || e) }, { status: 500, headers: noStore });
+  } finally {
+    // release the per-cycle lock
+    if (DATA_DIR && (await fsp.stat(DATA_DIR).catch(() => null))) {
+      if (lockPath) await fsp.unlink(lockPath).catch(() => {});
+    }
   }
 }
 
