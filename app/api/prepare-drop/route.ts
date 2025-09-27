@@ -223,27 +223,31 @@ export async function POST(req: Request) {
 
         const { deltaSol } = await pollSolDelta(conn, DEV.publicKey, preSolDev);
 
-       if (deltaSol <= 0) {
-  await db.upsertPrep({
-    cycleId: thisCycle,
-    acquiredPump: 0,
-    pumpToTreasury: 0,
-    pumpToTeam: 0,
-    claimedSol: 0,
-    claimSig: undefined,             // ← do NOT keep a link for idempotent/no-op
-    status: "ok",
-    ts: new Date().toISOString(),
-    creatorSolDelta: 0,
-    toTeamSolLamports: 0,
-    toTreasurySolLamports: 0,
-    toSwapUi: 0,
-    swapOutPumpUi: 0,
-  });
-  return NextResponse.json(
-    { ok: true, step: "claimed-zero", cycleId: thisCycle },
-    { headers: noStore }
-  );
-}
+        if (deltaSol <= 0) {
+          await db.upsertPrep({
+            cycleId: thisCycle,
+            acquiredPump: 0,
+            pumpToTreasury: 0,
+            pumpToTeam: 0,
+            claimedSol: 0,
+            claimSig: undefined,             // ← do NOT keep a link for idempotent/no-op
+            status: "ok",
+            ts: new Date().toISOString(),
+            creatorSolDelta: 0,
+            toTeamSolLamports: 0,
+            toTreasurySolLamports: 0,
+            toSwapUi: 0,
+            swapOutPumpUi: 0,
+            // ---- ADDED for proofs (DB-only) ----
+            creatorSol: 0,
+            pumpSwapped: 0,
+            swapSig: undefined,
+          });
+          return NextResponse.json(
+            { ok: true, step: "claimed-zero", cycleId: thisCycle },
+            { headers: noStore }
+          );
+        }
 
         /* 2) Split SOL */
         const freshLamports = Math.floor(deltaSol * LAMPORTS_PER_SOL);
@@ -307,6 +311,10 @@ export async function POST(req: Request) {
               toTreasurySolLamports: adjustedTreasuryLamports,
               toSwapUi,
               swapOutPumpUi: 0,
+              // ---- ADDED for proofs (DB-only) ----
+              creatorSol: deltaSol,
+              pumpSwapped: 0,
+              swapSig: undefined,
             });
             return NextResponse.json(
               { ok: false, step: "treasury-swap-failed", claimSig, teamSig, treasuryMoveSig, reason: String(lastErr) },
@@ -334,6 +342,10 @@ export async function POST(req: Request) {
           toTreasurySolLamports: adjustedTreasuryLamports,
           toSwapUi,
           swapOutPumpUi: pumpBoughtUi,
+          // ---- ADDED for proofs (DB-only) ----
+          creatorSol: deltaSol,
+          pumpSwapped: pumpBoughtUi,
+          swapSig: swapSigTreas || undefined,
         });
 
         const solscan = claimSig ? `https://solscan.io/tx/${encodeURIComponent(claimSig)}` : undefined;
@@ -375,4 +387,3 @@ export async function GET(req: Request) {
   // Allow GET to trigger the same flow (cron/debug) — still secret-gated.
   return POST(req);
 }
-
