@@ -10,9 +10,11 @@ import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, AccountLayout } from "@solana/
 
 type HolderRow = { wallet: string; balance: number; display?: string };
 
+// Server cache (shared for all users)
 let cache: { at: number; data: { holders: HolderRow[] } } | null = null;
-// Server cache TTL (clients still get no-store; server shields upstream)
-const TTL_MS = 5000;
+// 10s TTL + small jitter so multiple instances don't refetch at the same millisecond
+const TTL_MS = 10_000;
+const JITTER_MS = 250 + Math.random() * 250;
 
 // Single-flight to dedupe concurrent refreshes
 let pending: Promise<{ holders: HolderRow[]; debug?: any }> | null = null;
@@ -228,7 +230,7 @@ async function buildHolders(): Promise<{ holders: HolderRow[]; debug: any }> {
       perOwnerSize: perOwner.size,
       holdersLen: holders.length,
       ttlMs: TTL_MS,
-      autoBlacklistOver100M: true,
+      swr: true,
     },
   };
 }
@@ -253,38 +255,38 @@ export async function GET(req: Request) {
 
   try {
     const now = Date.now();
-    if (cache && now - cache.at < TTL_MS && !debug) {
-      return NextResponse.json(cache.data, { headers: { "cache-control": "no-store" } });
+    const fresh = cache && now - cache.at <= (TTL_MS + JITTER_MS);
+
+    // Serve fresh cache immediately
+    if (fresh && !debug) {
+      return NextResponse.json(cache!.data, { headers: { "cache-control": "no-store" } });
     }
 
-    // Single-flight: if a refresh is already in progress, await it
-    if (!pending) {
-      pending = buildHolders().finally(() => {
-        setTimeout(() => {
-          pending = null;
-        }, 50);
-      });
-    }
-
-    let payload: { holders: HolderRow[]; debug?: any };
-    try {
-      payload = await pending;
-
-      // Always cache the lean payload (no debug leakage)
-      cache = { at: now, data: { holders: payload.holders } };
-    } catch (err) {
-      console.error(JSON.stringify({ cid, where: "holders", error: String((err as any)?.message || err) }));
-      // Serve stale cache on failure
-      if (cache) {
+    // If we have stale cache, kick off background refresh and serve stale (SWR)
+    if (cache && !pending) {
+      pending = buildHolders()
+        .then((payload) => {
+          cache = { at: Date.now(), data: { holders: payload.holders } };
+          return payload;
+        })
+        .finally(() => setTimeout(() => { pending = null; }, 50));
+      if (!debug) {
         return NextResponse.json(cache.data, { headers: { "cache-control": "no-store" } });
       }
-      return NextResponse.json(
-        { holders: [], error: "Upstream fetch failed" },
-        { headers: { "cache-control": "no-store" }, status: 502 }
-      );
     }
 
-    console.info(JSON.stringify({ cid, where: "holders", holders: payload.holders.length }));
+    // No cache yet or debug requested: single-flight build (first request awaits)
+    if (!pending) {
+      pending = buildHolders()
+        .then((payload) => {
+          cache = { at: Date.now(), data: { holders: payload.holders } };
+          return payload;
+        })
+        .finally(() => setTimeout(() => { pending = null; }, 50));
+    }
+
+    const payload = await pending;
+    // console.info(JSON.stringify({ cid, where: "holders", holders: payload.holders.length }));
     const out = debug ? { holders: payload.holders, debug: payload.debug } : { holders: payload.holders };
     return NextResponse.json(out, { headers: { "cache-control": "no-store" } });
   } catch (e: any) {
