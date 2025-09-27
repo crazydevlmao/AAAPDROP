@@ -813,7 +813,9 @@ if (secLeft <= 0) {
       Your rank: <span className="font-semibold">#{myRank}</span>
     </div>
   )}
-        </section>
+</div>
+</section>
+
 
         {/* Tabs */}
         <div className="flex items-center gap-2 mb-6">
@@ -1509,6 +1511,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
