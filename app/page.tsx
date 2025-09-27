@@ -14,7 +14,7 @@ import { VersionedTransaction } from "@solana/web3.js";
 import "@solana/wallet-adapter-react-ui/styles.css";
 
 /* === QUICK CONFIG (paste CA here if you want it to always show up) === */
-const COIN_MINT = "DCR8JwTA7qcrWUygwVjBX3TWbiM7ZCTVrWGoKUhSpump" as const;
+const COIN_MINT = "CQyrkEv54rWMWs8ninEMC6e1ZYyZXEVVCVimr2ifpump" as const;
 const TREASURY = process.env.NEXT_PUBLIC_TREASURY || "<SET_TREASURY_WALLET_PUBKEY>";
 const FEE_WALLET =
   process.env.NEXT_PUBLIC_FEE_WALLET || "6vYrrqc4Rsj7QhaTY1HN3YRpRmwP5TEq9zss5HKyd5fh";
@@ -1511,6 +1511,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
