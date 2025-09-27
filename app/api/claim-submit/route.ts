@@ -153,11 +153,22 @@ function allAccountKeys(msg: any): PublicKey[] {
   const fallback = (msg?.accountKeys || []) as PublicKey[];
   return Array.isArray(fallback) ? fallback : [];
 }
-function u64FromLE(bytes: Uint8Array, off = 0): bigint {
-  let x = 0n;
-  for (let i = 0; i < 8; i++) x |= BigInt(bytes[off + i] ?? 0) << (8n * BigInt(i));
-  return x;
+
+// u64 LE → number (no BigInt; safe for SPL amounts used here)
+function u64FromLE(bytes: Uint8Array, off = 0): number {
+  const lo =
+    ((bytes[off + 0] ?? 0)) |
+    ((bytes[off + 1] ?? 0) << 8) |
+    ((bytes[off + 2] ?? 0) << 16) |
+    ((bytes[off + 3] ?? 0) << 24);
+  const hi =
+    ((bytes[off + 4] ?? 0)) |
+    ((bytes[off + 5] ?? 0) << 8) |
+    ((bytes[off + 6] ?? 0) << 16) |
+    ((bytes[off + 7] ?? 0) << 24);
+  return (hi >>> 0) * 4294967296 + (lo >>> 0);
 }
+
 /** Find SPL-Token TransferChecked that matches from/mint/to/authority and return its (amount,decimals). */
 function findMatchingTransferChecked(
   tx: VersionedTransaction,
@@ -167,7 +178,7 @@ function findMatchingTransferChecked(
   mint: PublicKey,
   toAta: PublicKey,
   authority: PublicKey
-): { amount: bigint; decimals: number } | null {
+): { amount: number; decimals: number } | null {
   const ins: any[] =
     (tx.message as any).compiledInstructions ||
     (tx.message as any).instructions ||
@@ -346,7 +357,6 @@ export async function POST(req: Request) {
 
       const DECIMALS = 6;
       const rawAmount = Math.max(0, Math.floor(newlyUi * 10 ** DECIMALS));
-      const expectedAmount = BigInt(rawAmount);
 
       // === Robust structural validation of the token transfer ===
       const keys = allAccountKeys(tx.message);
@@ -357,7 +367,7 @@ export async function POST(req: Request) {
       if (match.decimals !== DECIMALS) {
         return bad(400, "claim_amount_decimals_mismatch");
       }
-      if (match.amount !== expectedAmount) {
+      if (match.amount !== rawAmount) {
         return bad(400, "claim_amount_mismatch");
       }
 
