@@ -9,7 +9,8 @@ import { pumpPriceInfo } from "@/lib/price";
 import { db } from "@/lib/db";
 
 /* ===== Config ===== */
-const TTL_MS = 10_000; // server-side cache for price + total (protects upstream)
+const TTL_MS = 60_000; // server-side cache for price + total (protects upstream)
+const JITTER_MS = 250 + Math.random() * 250; // spread refresh across instances
 const DROP_SECRET = process.env.DROP_SECRET || "";
 
 /* ===== Cache & single-flight ===== */
@@ -71,6 +72,7 @@ async function computeMetrics(): Promise<Metrics> {
 /* ===== GET ===== */
 export async function GET(req: Request) {
   const cid = cidOf(req);
+
   // Light per-IP throttle: 120/min is plenty (server cache prevents dogpiles)
   const ip =
     (req.headers.get("x-forwarded-for") || "").split(",")[0].trim() ||
@@ -83,24 +85,30 @@ export async function GET(req: Request) {
 
   try {
     const now = Date.now();
-    if (cache && now - cache.at < TTL_MS) {
+    const fresh = cache && now - cache.at <= (TTL_MS + JITTER_MS);
+
+    // If we have cache and it's still fresh, return immediately.
+    if (fresh) return json(cache!.data);
+
+    // If we have cache but it's stale, kick off a background refresh
+    // and serve stale immediately (SWR).
+    if (cache && !pending) {
+      pending = computeMetrics()
+        .then((data) => { cache = { at: Date.now(), data }; return data; })
+        .finally(() => setTimeout(() => { pending = null; }, 50));
       return json(cache.data);
     }
 
+    // No cache yet: do a single-flight compute and await the result.
     if (!pending) {
       pending = computeMetrics()
-        .then((data) => {
-          cache = { at: Date.now(), data };
-          return data;
-        })
-        .finally(() => {
-          // brief gap to avoid immediate reflood after resolve
-          setTimeout(() => { pending = null; }, 50);
-        });
+        .then((data) => { cache = { at: Date.now(), data }; return data; })
+        .finally(() => setTimeout(() => { pending = null; }, 50));
     }
 
     const data = await pending;
-    console.info(JSON.stringify({ cid, where: "metrics.GET", price: data.pumpPrice, total: data.totalDistributedPump }));
+    // keep logs lean
+    // console.info(JSON.stringify({ cid, where: "metrics.GET", price: data.pumpPrice, total: data.totalDistributedPump }));
     return json(data);
   } catch (e: any) {
     console.error(JSON.stringify({ cid, where: "metrics.GET", error: String(e?.message || e) }));
@@ -132,10 +140,9 @@ export async function POST(req: Request) {
     await db.addToTotalDistributed(add);
     const totalDistributedPump = await db.totalDistributedPump();
 
-    // Invalidate cache (cheap) so GET refreshes next time
+    // Invalidate cache so GET refreshes on next request
     cache = null;
 
-    console.info(JSON.stringify({ cid, where: "metrics.POST", add, total: totalDistributedPump }));
     return json({ ok: true, totalDistributedPump });
   } catch (e: any) {
     console.error(JSON.stringify({ cid, where: "metrics.POST", error: String(e?.message || e) }));
