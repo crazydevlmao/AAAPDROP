@@ -527,7 +527,7 @@ if (
   }
 }
 
-// T-8s: pre-snapshot refresh (no secret routes). Nudge UI right before drop.
+// T-8s: pre-snapshot refresh (no toast here anymore; we show it at exact T-0)
 if (
   !didPreSnapshotRef.current &&
   secLeft <= SNAPSHOT_OFFSET_SECONDS &&
@@ -540,11 +540,10 @@ if (
       const j = await fetch("/api/holders", { cache: "no-store" }).then((r) => r.json());
       if (Array.isArray(j?.holders)) setHolders(j.holders);
     } catch {}
-    showToast("New drop is ready — claim your $PUMP!", "success");
   })();
 }
 
-// T-0: final refresh at boundary (belt & suspenders)
+// T-0: final refresh at boundary + show green toast
 if (!didZeroRef.current && secLeft <= 1) {
   didZeroRef.current = true;
   (async () => {
@@ -553,6 +552,7 @@ if (!didZeroRef.current && secLeft <= 1) {
       const j = await fetch("/api/holders", { cache: "no-store" }).then((r) => r.json());
       if (Array.isArray(j?.holders)) setHolders(j.holders);
     } catch {}
+    showToast("New drop is ready — claim your $PUMP!", "success");
   })();
 }
 
@@ -1476,6 +1476,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
