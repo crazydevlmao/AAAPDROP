@@ -227,7 +227,17 @@ export async function POST(req: Request) {
           // Snapshot set must match exactly (order-insensitive)
           const a = new Set<string>((row.snapshotIds || []).map(String));
           const b = new Set<string>(snapshotIds);
-          if (a.size !== b.size || [...a].some((s) => !b.has(s))) {
+
+          let previewMismatch = false;
+          if (a.size !== b.size) {
+            previewMismatch = true;
+          } else {
+            a.forEach((s) => {
+              if (!b.has(s)) previewMismatch = true;
+            });
+          }
+
+          if (previewMismatch) {
             return bad(400, "preview_snapshot_mismatch");
           }
           // Amount must match (UI units)
