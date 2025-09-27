@@ -10,8 +10,15 @@ import {
   VersionedTransaction,
   PublicKey,
   clusterApiUrl,
+  ComputeBudgetProgram,
+  TransactionMessage,
+  SystemProgram,
 } from "@solana/web3.js";
-import { db } from "@/lib/db";
+import {
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferCheckedInstruction,
+} from "@solana/spl-token";
 import {
   connection,
   keypairFromEnv,
@@ -19,25 +26,24 @@ import {
   getMintTokenProgramId,
   PUMP_MINT,
 } from "@/lib/solana";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { db } from "@/lib/db";
+import { createHash } from "crypto";
 
 /* ===== Config ===== */
-// Browser calls this route → DO NOT require DROP_SECRET. If present, accept but never require it.
 const DROP_SECRET = process.env.DROP_SECRET || "";
-
-// Tight limits so a single user can’t DDoS the relay:
 const RATE_PER_MIN_IP = 30;
 const RATE_PER_MIN_WALLET = 30;
-
-// Entitlement units (raw lamports of 6-dec token vs UI)
 const ENTITLEMENT_IS_RAW = String(process.env.ENTITLEMENT_IS_RAW || "").toLowerCase() === "true";
 
-// Optional fallback endpoint for bursty slots:
+// Optional fallback endpoint for bursty slots
 const FALLBACK_RPC =
   process.env.SOLANA_RPC_FALLBACK ||
   process.env.NEXT_PUBLIC_SOLANA_RPC_2 ||
   process.env.HELIUS_RPC_2 ||
   "";
+
+// How long a preview is valid (if you choose to bind submit to preview)
+const PREVIEW_TTL_MS = 120_000;
 
 /* ===== tiny helpers ===== */
 const noStore = {
@@ -48,7 +54,8 @@ const noStore = {
   },
 };
 const json = (data: any, init?: ResponseInit) => NextResponse.json(data, { ...init, ...noStore });
-const bad = (status: number, msg: string, extra?: any) => json({ ok: false, error: msg, ...extra }, { status });
+const bad = (status: number, msg: string, extra?: any) =>
+  json({ ok: false, error: msg, ...extra }, { status });
 
 const cidOf = (req: Request) =>
   req.headers.get("x-request-id") ||
@@ -64,7 +71,10 @@ function allow(bucket: Map<string, Bucket>, key: string, ratePerMin: number) {
   const refill = ratePerMin / 60000;
   const slot = bucket.get(key) ?? { tokens: ratePerMin, ts: now };
   const tokens = Math.min(ratePerMin, slot.tokens + (now - slot.ts) * refill);
-  if (tokens < 1) { bucket.set(key, { tokens, ts: now }); return false; }
+  if (tokens < 1) {
+    bucket.set(key, { tokens, ts: now });
+    return false;
+  }
   bucket.set(key, { tokens: tokens - 1, ts: now });
   return true;
 }
@@ -74,7 +84,9 @@ function parseWallet(raw: any): PublicKey | null {
     const s = String(raw ?? "").trim();
     if (s.length < 32 || s.length > 64) return null;
     return new PublicKey(s);
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 function connFrom(url?: string) {
@@ -100,20 +112,16 @@ async function sendWithFallback(tx: VersionedTransaction, primary: Connection): 
       const isRate = /rate|429|too many requests|limit/i.test(msg);
       const isBusy = /blockhash.*not found|node is behind|already processed/i.test(msg);
       if (i < maxAttempts - 1 && (isRate || isBusy)) {
-        await new Promise(r => setTimeout(r, baseDelay * Math.pow(2, i)));
+        await new Promise((r) => setTimeout(r, baseDelay * Math.pow(2, i)));
         continue;
       }
       if (FALLBACK_RPC && (isRate || isBusy)) {
-        try {
-          const fallbackConn = connFrom(FALLBACK_RPC);
-          return await fallbackConn.sendRawTransaction(tx.serialize(), {
-            skipPreflight: true,
-            maxRetries: 5,
-            preflightCommitment: "confirmed",
-          });
-        } catch (e: any) {
-          throw new Error(`relay failed (fallback): ${String(e?.message || e)}`);
-        }
+        const fallbackConn = connFrom(FALLBACK_RPC);
+        return await fallbackConn.sendRawTransaction(tx.serialize(), {
+          skipPreflight: true,
+          maxRetries: 5,
+          preflightCommitment: "confirmed",
+        });
       }
       throw new Error(`relay failed: ${msg}`);
     }
@@ -121,22 +129,11 @@ async function sendWithFallback(tx: VersionedTransaction, primary: Connection): 
   throw new Error("relay failed: attempts exhausted");
 }
 
-// Include ALT lookups (for safety when wallets use LUTs)
-function allAccountKeys(msg: any): PublicKey[] {
-  try {
-    const ak = msg.getAccountKeys?.();
-    if (ak) {
-      const out: PublicKey[] = [...(ak.staticAccountKeys || [])];
-      const look = (ak as any).accountKeysFromLookups;
-      if (look) {
-        if (Array.isArray(look.writable)) out.push(...look.writable);
-        if (Array.isArray(look.readonly)) out.push(...look.readonly);
-      }
-      if (out.length) return out;
-    }
-  } catch {}
-  const fallback = (msg?.accountKeys || []) as PublicKey[];
-  return Array.isArray(fallback) ? fallback : [];
+/* ===== Per-wallet in-flight lock (prevents double-spend races) ===== */
+const BUSY_WALLETS = new Set<string>();
+
+function sha256Msg(u8: Uint8Array) {
+  return createHash("sha256").update(u8).digest("hex");
 }
 
 /* ===== Route ===== */
@@ -144,7 +141,7 @@ export async function POST(req: Request) {
   const cid = cidOf(req);
 
   try {
-    // Optional secret: if provided & mismatched, reject; never required.
+    // Optional secret: accept if provided & correct; never required by browser.
     if (DROP_SECRET) {
       const provided = req.headers.get("x-drop-secret");
       if (provided && provided !== DROP_SECRET) {
@@ -165,7 +162,11 @@ export async function POST(req: Request) {
 
     const userPk = parseWallet(body.wallet);
     const signedTxB64 = String(body.signedTxB64 || "").trim();
-    const unsignedTxB64 = typeof body.unsignedTxB64 === "string" ? body.unsignedTxB64.trim() : ""; // optional
+
+    // optional: stronger binding to a preview
+    const previewId: string = typeof body.previewId === "string" ? body.previewId.trim() : "";
+    const msgHashClient: string = typeof body.msgHash === "string" ? body.msgHash.trim() : "";
+
     const snapshotIds: string[] = Array.isArray(body.snapshotIds) ? body.snapshotIds.map(String) : [];
     const amtNum = Number(body.amount);
     const amountClient = Number.isFinite(amtNum) && amtNum > 0 ? amtNum : 0;
@@ -181,121 +182,172 @@ export async function POST(req: Request) {
       return bad(429, "Too Many Requests (wallet)");
     }
 
-    // === Re-derive entitlements server-side (idempotent + anti-tamper) ===
-    const ent = await db.listWalletEntitlements(userLc);
-    const isInSnapshot = new Set(snapshotIds);
-    let newlyUi = 0;  // amount still unclaimed for these snapshots (UI units)
-    let totalUi = 0;
-
-    for (const r of ent) {
-      if (!isInSnapshot.has(String(r.snapshotId))) continue;
-      const a = Number(r.amount || 0);
-      const ui = Number.isFinite(a) ? (ENTITLEMENT_IS_RAW ? a / 1e6 : a) : 0;
-      totalUi += ui;
-      if (!r.claimed) newlyUi += ui;
+    // HARD GUARD: one in-flight claim per wallet across this instance
+    if (BUSY_WALLETS.has(userLc)) {
+      return bad(409, "Claim already in progress for this wallet");
     }
+    BUSY_WALLETS.add(userLc);
 
-    if (newlyUi <= 0) {
-      return bad(409, "Nothing left to claim for these snapshots");
-    }
-    if (amountClient > 0 && amountClient - newlyUi > 1e-9) {
-      return bad(400, "Amount exceeds unclaimed entitlements");
-    }
+    try {
+      // === Deserialize the user-signed tx (Phantom signs first) ===
+      const raw = Buffer.from(signedTxB64, "base64");
+      const tx = VersionedTransaction.deserialize(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
 
-    // === Deserialize the user-signed tx (Phantom signs first) ===
-    const raw = Buffer.from(signedTxB64, "base64");
-    const tx = VersionedTransaction.deserialize(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
+      // Fee payer must be the user
+      const feePayer = tx.message.staticAccountKeys[0];
+      if (!feePayer.equals(userPk)) {
+        return bad(400, "Invalid fee payer");
+      }
 
-    // Fee payer must be the user
-    const feePayer = tx.message.staticAccountKeys[0];
-    if (!feePayer.equals(userPk)) {
-      return bad(400, "Invalid fee payer");
-    }
+      // Optional preview binding (idempotency + anti-replay)
+      if (previewId) {
+        try {
+          const row =
+            (db as any).getPreviewById ? await (db as any).getPreviewById(previewId) : null;
 
-    // ---- Soft preview consistency check (NO hard-fail) ----
-    if (unsignedTxB64) {
-      try {
-        const rawU = Buffer.from(unsignedTxB64, "base64");
-        const unsigned = VersionedTransaction.deserialize(new Uint8Array(rawU.buffer, rawU.byteOffset, rawU.byteLength));
-        const expectMsg = Buffer.from(unsigned.message.serialize()).toString("base64");
-        const actualMsg = Buffer.from(tx.message.serialize()).toString("base64");
-        if (expectMsg !== actualMsg) {
-          console.warn(JSON.stringify({ cid, where: "claim-submit", warn: "preview_mismatch_ok" }));
-          // continue — do not block
+          if (!row) {
+            return bad(400, "no_preview_for_wallet");
+          }
+          if (row.walletLc !== userLc) {
+            return bad(400, "preview_wallet_mismatch");
+          }
+          if (row.consumed) {
+            // If DB tracks a saved signature, return it for idempotency UX
+            return bad(409, "preview_already_consumed", { sig: row.sig || undefined });
+          }
+          if (Date.now() - Number(row.createdAt || 0) > PREVIEW_TTL_MS) {
+            return bad(400, "preview_expired");
+          }
+          // Compare message hash from tx against preview msgHash (or provided msgHash)
+          const actualHash = sha256Msg(tx.message.serialize());
+          const expectedHash = String(row.msgHash || msgHashClient || "");
+          if (!expectedHash || expectedHash !== actualHash) {
+            return bad(400, "preview_message_mismatch");
+          }
+          // Snapshot set must match exactly (order-insensitive)
+          const a = new Set<string>((row.snapshotIds || []).map(String));
+          const b = new Set<string>(snapshotIds);
+          if (a.size !== b.size || [...a].some((s) => !b.has(s))) {
+            return bad(400, "preview_snapshot_mismatch");
+          }
+          // Amount must match (UI units)
+          const pvAmt = Number(row.amount || 0);
+          if (!(Number.isFinite(pvAmt) && Math.abs(pvAmt - amountClient) < 1e-9)) {
+            return bad(400, "preview_amount_mismatch");
+          }
+        } catch {
+          // If preview lookup fails, keep going (wallet lock still prevents x2 on this instance)
         }
-      } catch (e: any) {
-        console.warn(JSON.stringify({ cid, where: "claim-submit", warn: "preview_parse_failed_ok", detail: String(e?.message || e) }));
       }
-    }
 
-    // ---- Light sanity checks on accounts (NO hard-fail) ----
-    try {
-      const conn = connection();
+      // === Re-derive entitlements server-side (anti-tamper + idempotent) ===
+      const ent = await db.listWalletEntitlements(userLc);
+      const isInSnapshot = new Set(snapshotIds);
+
+      let newlyUi = 0;
+      let totalUi = 0;
+      for (const r of ent) {
+        if (!isInSnapshot.has(String(r.snapshotId))) continue;
+        const a = Number(r.amount || 0);
+        const ui = Number.isFinite(a) ? (ENTITLEMENT_IS_RAW ? a / 1e6 : a) : 0;
+        totalUi += ui;
+        if (!r.claimed) newlyUi += ui;
+      }
+
+      if (newlyUi <= 0) {
+        return bad(409, "Nothing left to claim for these snapshots");
+      }
+      if (amountClient > 0 && amountClient - newlyUi > 1e-9) {
+        return bad(400, "Amount exceeds unclaimed entitlements");
+      }
+
+      // === Rebuild EXPECTED message from re-derived amount (binds amount/fee/accounts) ===
+      const primaryConn = connection();
       const treasuryPubkey = pubkeyFromEnv("NEXT_PUBLIC_TREASURY");
-      const tokenProgramId = await getMintTokenProgramId(conn, PUMP_MINT);
+      const tokenProgramId = await getMintTokenProgramId(primaryConn, PUMP_MINT);
+
       const fromAta = getAssociatedTokenAddressSync(PUMP_MINT, treasuryPubkey, false, tokenProgramId);
-      const toAta   = getAssociatedTokenAddressSync(PUMP_MINT, userPk,        false, tokenProgramId);
-      const keys = allAccountKeys(tx.message);
-      const hasTreasury = keys.some(k => k.equals(treasuryPubkey));
-      const hasFromAta  = keys.some(k => k.equals(fromAta));
-      const hasToAta    = keys.some(k => k.equals(toAta));
-      const hasMint     = keys.some(k => k.equals(PUMP_MINT));
-      if (!(hasTreasury && hasFromAta && hasToAta && hasMint)) {
-        console.warn(JSON.stringify({ cid, where: "claim-submit", warn: "account_sanity_warn", hasTreasury, hasFromAta, hasToAta, hasMint }));
-        // continue — treasury co-sign still protects us
+      const toAta = getAssociatedTokenAddressSync(PUMP_MINT, userPk, false, tokenProgramId);
+
+      const DECIMALS = 6;
+      const rawAmount = Math.max(0, Math.floor(newlyUi * 10 ** DECIMALS));
+
+      const CLAIM_FEE_SOL_RAW = Number(process.env.CLAIM_FEE_SOL ?? "0.01");
+      const CLAIM_FEE_SOL = Number.isFinite(CLAIM_FEE_SOL_RAW) ? Math.max(0, CLAIM_FEE_SOL_RAW) : 0.01;
+      const feeLamports = Math.max(0, Math.floor(CLAIM_FEE_SOL * 1_000_000_000));
+
+      const expectedIxs = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
+        createAssociatedTokenAccountIdempotentInstruction(userPk, fromAta, treasuryPubkey, PUMP_MINT, tokenProgramId),
+        createAssociatedTokenAccountIdempotentInstruction(userPk, toAta, userPk, PUMP_MINT, tokenProgramId),
+        ...(feeLamports > 0
+          ? [SystemProgram.transfer({ fromPubkey: userPk, toPubkey: treasuryPubkey, lamports: feeLamports })]
+          : []),
+        createTransferCheckedInstruction(fromAta, PUMP_MINT, toAta, treasuryPubkey, rawAmount, DECIMALS, [], tokenProgramId),
+      ];
+
+      const expectedMsg = new TransactionMessage({
+        payerKey: userPk,
+        recentBlockhash: tx.message.recentBlockhash, // bind to the user's blockhash
+        instructions: expectedIxs,
+      }).compileToV0Message();
+
+      const expectedMsgB64 = Buffer.from(expectedMsg.serialize()).toString("base64");
+      const actualMsgB64 = Buffer.from(tx.message.serialize()).toString("base64");
+      if (expectedMsgB64 !== actualMsgB64) {
+        return bad(400, "Submitted transaction does not match the issued preview");
       }
-    } catch {}
 
-    // === Server co-sign & relay ===
-    const treasuryKp = keypairFromEnv("TREASURY_SECRET");
-    tx.sign([treasuryKp]);
+      // === Server co-sign & relay ===
+      const treasuryKp = keypairFromEnv("TREASURY_SECRET");
+      tx.sign([treasuryKp]);
 
-    const primaryConn = connection();
-    let sig = "";
-    try {
-      sig = await sendWithFallback(tx, primaryConn);
-    } catch (e: any) {
-      return bad(502, "Upstream relay error", { detail: String(e?.message || e).slice(0, 200) });
+      let sig = "";
+      try {
+        sig = await sendWithFallback(tx, primaryConn);
+      } catch (e: any) {
+        return bad(502, "Upstream relay error", { detail: String(e?.message || e).slice(0, 200) });
+      }
+
+      // Best-effort confirm
+      try {
+        await primaryConn.confirmTransaction(sig, "confirmed");
+      } catch {}
+
+      // Mark preview consumed (if DB supports it)
+      try {
+        if (previewId && (db as any).markPreviewConsumed) {
+          await (db as any).markPreviewConsumed(previewId, sig);
+        }
+      } catch {}
+
+      // === Mark claimed (idempotent) & update UX metrics ONLY for newly claimed ===
+      try {
+        if ((db as any).markEntitlementsClaimed) {
+          await (db as any).markEntitlementsClaimed(userLc, snapshotIds, sig);
+        }
+      } catch {}
+
+      try {
+        await db.insertRecentClaim({
+          wallet: userBase58,
+          amount: newlyUi,
+          sig,
+          ts: new Date().toISOString(),
+        });
+      } catch {}
+
+      try {
+        await db.addToTotalDistributed(newlyUi);
+      } catch {}
+
+      const solscan = `https://solscan.io/tx/${encodeURIComponent(sig)}`;
+      return json({ ok: true, sig, solscan, claimed: newlyUi });
+    } finally {
+      BUSY_WALLETS.delete(userLc);
     }
-
-    // Single confirm (non-blocking if it times out)
-    try { await primaryConn.confirmTransaction(sig, "confirmed"); } catch {}
-
-    // === Mark claimed (idempotent) & update metrics ONLY for newly claimed ===
-    try {
-      if ((db as any).markEntitlementsClaimed) {
-        await (db as any).markEntitlementsClaimed(userLc, snapshotIds, sig);
-      }
-    } catch {}
-
-    // Persist claim feed for UX; amount = newlyUi
-    try {
-      await db.insertRecentClaim({
-        wallet: userBase58,
-        amount: newlyUi,
-        sig,
-        ts: new Date().toISOString(),
-      });
-    } catch {}
-
-    try {
-      await db.addToTotalDistributed(newlyUi);
-    } catch {}
-
-    const solscan = `https://solscan.io/tx/${encodeURIComponent(sig)}`;
-
-    console.info(JSON.stringify({
-      cid,
-      where: "claim-submit",
-      wallet: userBase58,
-      sig,
-      snapshots: snapshotIds.length,
-      newlyUi,
-    }));
-
-    return json({ ok: true, sig, solscan, claimed: newlyUi });
   } catch (e: any) {
-    console.error(JSON.stringify({ cid, where: "claim-submit", error: String(e?.message || e) }));
+    console.error(JSON.stringify({ cid: cidOf(req), where: "claim-submit", error: String(e?.message || e) }));
     return bad(500, String(e?.message || e || "Internal Error"));
   }
 }
