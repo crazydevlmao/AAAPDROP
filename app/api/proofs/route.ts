@@ -95,7 +95,7 @@ function allAccountKeys(msg: any): PublicKey[] {
   return Array.isArray(fallback) ? fallback : [];
 }
 
-/** Quick check: does this tx have the Pump log line? (prefer confirmed; fall back to finalized) */
+/** Quick check: does this tx have the Collect Creator Fee log? (supports both forms) */
 async function isCollectCreatorFee(sig: string): Promise<boolean> {
   const key = "isCollect:" + sig;
   const hit = TX_CACHE.get(key);
@@ -105,12 +105,19 @@ async function isCollectCreatorFee(sig: string): Promise<boolean> {
   }
   try {
     const conn = connection();
+    // pull quickly at confirmed; fall back to finalized if needed
     let tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
     if (!tx) {
       tx = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0, commitment: "finalized" });
     }
     const logs: string[] = (tx?.meta?.logMessages || []).filter(Boolean) as string[];
-    const ok = logs.some((l) => l.toLowerCase().includes("collect_creator_fee"));
+
+    // Accept either "Instruction: CollectCoinCreatorFee" or "collect_creator_fee"
+    const ok = logs.some((l) =>
+      /instruction:\s*collectcoincreatorfee/i.test(l) ||
+      /collect[_\s]?creator[_\s]?fee/i.test(l)
+    );
+
     TX_CACHE.set(key, { at: now, isCollect: ok });
     return ok;
   } catch {
@@ -238,9 +245,9 @@ async function enrichFromPrep(prep: any, treasury: PublicKey, devPub: PublicKey)
     creatorSol,
     pumpSwapped,
     txs: {
-      // Show claim link only if the tx is truly a collect_creator_fee AND value > 0
+      // Show claim link only if the tx is truly a collect-creator-fee AND value > 0
       claimSig: claimOk && creatorSol > 0 ? claimSig : null,
-      // Show swap link if we have a signature (even if parsed delta is 0 due to route mechanics)
+      // Show swap link if we have a signature
       swapSig: swapSig || null,
     },
   };
