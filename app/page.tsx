@@ -743,13 +743,15 @@ if (secLeft <= 0) {
 
           {/* Claim + Share */}
 <div className="mt-3 flex flex-col items-center gap-3 w-full max-w-xl">
-  {/* Claim button with "No Claimable $PUMP" hover when disabled due to zero unclaimed */}
+  {/* Claim button with disabled state when no claimable and hover tooltip */}
   <div className="relative w-full group">
     <button
       onClick={handleClaim}
       disabled={!connected || claiming || unclaimed <= 0}
       className={`btn-claim w-full ${
-        !connected || claiming || unclaimed <= 0 ? "disabled opacity-60 cursor-not-allowed" : "pulse"
+        !connected || claiming || unclaimed <= 0
+          ? "disabled opacity-60 cursor-not-allowed"
+          : "pulse"
       }`}
       title={
         !connected
@@ -759,7 +761,11 @@ if (secLeft <= 0) {
           : "Claim your $PUMP"
       }
     >
-      {!connected ? "Connect Wallet to Claim" : claiming ? "Claiming…" : "CLAIM $PUMP"}
+      {!connected
+        ? "Connect Wallet to Claim"
+        : claiming
+        ? "Claiming…"
+        : "CLAIM $PUMP"}
     </button>
 
     {/* Tooltip only when connected, not claiming, and nothing to claim */}
@@ -808,6 +814,7 @@ if (secLeft <= 0) {
     </div>
   )}
 </div>
+
 
             )}
 
@@ -1513,6 +1520,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
