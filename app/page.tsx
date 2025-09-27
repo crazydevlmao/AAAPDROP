@@ -813,17 +813,6 @@ if (secLeft <= 0) {
       Your rank: <span className="font-semibold">#{myRank}</span>
     </div>
   )}
-</div>
-
-
-            )}
-
-            {connected && myRank && (
-              <div className="text-xs opacity-80 mt-1">
-                Your rank: <span className="font-semibold">#{myRank}</span>
-              </div>
-            )}
-          </div>
         </section>
 
         {/* Tabs */}
@@ -1520,6 +1509,7 @@ export default function Page() {
     </ConnectionProvider>
   );
 }
+
 
 
 
