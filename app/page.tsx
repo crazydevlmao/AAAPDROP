@@ -220,6 +220,8 @@ function InnerApp() {
   const [pumpBalance, setPumpBalance] = useState(0);
   const [snapshotTs, setSnapshotTs] = useState<string | null>(null);
   const [snapshotId, setSnapshotId] = useState<string | null>(null);
+// tooltip for disabled (no claimable) state
+const [showNoClaimTip, setShowNoClaimTip] = useState(false);
 
   /* Metrics (price + normalized 24h pct change) */
   const [totalDistributedPump, setTotalDistributedPump] = useState(0);
@@ -740,38 +742,73 @@ if (secLeft <= 0) {
           </div>
 
           {/* Claim + Share */}
-          <div className="mt-3 flex flex-col items-center gap-3 w-full max-w-xl">
-            <button
-              onClick={handleClaim}
-              disabled={!connected || claiming}
-              className={`btn-claim w-full ${!connected || claiming ? "disabled" : "pulse"}`}
-              title={connected ? "Claim your $PUMP" : "Connect wallet first"}
-            >
-              {connected ? (claiming ? "Claiming…" : "CLAIM $PUMP") : "Connect Wallet to Claim"}
-            </button>
+<div className="mt-3 flex flex-col items-center gap-3 w-full max-w-xl">
+  {/* Claim button with "No Claimable $PUMP" hover when disabled due to zero unclaimed */}
+  <div className="relative w-full group">
+    <button
+      onClick={handleClaim}
+      disabled={!connected || claiming || unclaimed <= 0}
+      className={`btn-claim w-full ${
+        !connected || claiming || unclaimed <= 0 ? "disabled opacity-60 cursor-not-allowed" : "pulse"
+      }`}
+      title={
+        !connected
+          ? "Connect wallet first"
+          : unclaimed <= 0
+          ? "No Claimable $PUMP"
+          : "Claim your $PUMP"
+      }
+    >
+      {!connected ? "Connect Wallet to Claim" : claiming ? "Claiming…" : "CLAIM $PUMP"}
+    </button>
 
-            {connected && (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full">
-                <div className="rounded-xl p-3 border border-[#2a2a33] bg-[#111118]">
-                  <div className="text-xs opacity-70">Claimable now</div>
-                  <div className="text-lg font-semibold">
-                    {unclaimed.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
-                  </div>
-                </div>
-                <div className="rounded-xl p-3 border border-[#2a2a33] bg-[#111118]">
-                  <div className="text-xs opacity-70">Claimed total</div>
-                  <div className="text-lg font-semibold">
-                    {claimed.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
-                  </div>
-                </div>
-                <div className="rounded-xl p-3 border border-[#2a2a33] bg-[#111118]">
-                  <div className="text-xs opacity-70">Total earned (all-time)</div>
-                  <div className="text-lg font-semibold">{formatUSD(entitled * pumpPrice)}</div>
-                  <div className="text-xs opacity-60 mt-1">
-                    ({entitled.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP)
-                  </div>
-                </div>
-              </div>
+    {/* Tooltip only when connected, not claiming, and nothing to claim */}
+    {connected && !claiming && unclaimed <= 0 && (
+      <div
+        className="pointer-events-none hidden group-hover:block absolute left-1/2 -translate-x-1/2 -top-11 z-[10001]
+                   rounded-lg px-3 py-1.5 text-xs text-white shadow-lg"
+        style={{
+          background: "#101017",
+          border: "1px solid #2a2a33",
+          boxShadow: "0 0 16px rgba(0,255,194,0.18)",
+        }}
+      >
+        No Claimable $PUMP
+      </div>
+    )}
+  </div>
+
+  {connected && (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full">
+      <div className="rounded-xl p-3 border border-[#2a2a33] bg-[#111118]">
+        <div className="text-xs opacity-70">Claimable now</div>
+        <div className="text-lg font-semibold">
+          {unclaimed.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
+        </div>
+      </div>
+      <div className="rounded-xl p-3 border border-[#2a2a33] bg-[#111118]">
+        <div className="text-xs opacity-70">Claimed total</div>
+        <div className="text-lg font-semibold">
+          {claimed.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP
+        </div>
+      </div>
+      <div className="rounded-xl p-3 border border-[#2a2a33] bg-[#111118]">
+        <div className="text-xs opacity-70">Total earned (all-time)</div>
+        <div className="text-lg font-semibold">{formatUSD(entitled * pumpPrice)}</div>
+        <div className="text-xs opacity-60 mt-1">
+          ({entitled.toLocaleString(undefined, { maximumFractionDigits: 6 })} $PUMP)
+        </div>
+      </div>
+    </div>
+  )}
+
+  {connected && myRank && (
+    <div className="text-xs opacity-80 mt-1">
+      Your rank: <span className="font-semibold">#{myRank}</span>
+    </div>
+  )}
+</div>
+
             )}
 
             {connected && myRank && (
