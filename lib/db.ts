@@ -33,6 +33,11 @@ export type Prep = {
   swapSigs?: string[];
   splitSigs?: string[];
 
+  // === NEW: written by prepare-drop, read by proofs (DB-backed, no RPC spam)
+  creatorSol?: number;      // SOL actually received on DEV for this cycle
+  pumpSwapped?: number;     // PUMP amount swapped into Treasury for this cycle (UI units)
+  swapSig?: string;         // primary swap tx (Solscan link derives from this)
+
   status: "ok" | "swap_failed_or_dust" | "error";
   ts: string;
 };
@@ -185,7 +190,12 @@ export const db = {
   async upsertPrep(p: Prep) {
     const rows = await read<Prep>(files.preps);
     const i = rows.findIndex(r => r.cycleId === p.cycleId);
-    if (i >= 0) rows[i] = p; else rows.push(p);
+    if (i >= 0) {
+      // merge to avoid wiping optional fields not provided by the caller
+      rows[i] = { ...rows[i], ...p };
+    } else {
+      rows.push(p);
+    }
     await write(files.preps, rows);
   },
   async getPrep(cycleId: string): Promise<Prep | undefined> {
